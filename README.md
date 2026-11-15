@@ -9,7 +9,7 @@
 
 [![Project Diablo 2](https://shields.io)]()
 [![TOS Safe](https://shields.io)]()
-[![Built With Go](https://shields.io)]()
+[![Built With Go & Python!](https://shields.io)]()
 
 </div>
 
