@@ -45,7 +45,7 @@ TOWN_ZONES = {
 # 4. Loot Filter Patterns (Regex)
 DROP_PATTERNS = [
     r"(?i)\b(el|eld|tir|nef|eth|ith|tal|ral|ort|thul|amn|sol|shael|dol|hel|io|lum|ko|fal|lem|pul|um|mal|ist|gul|vex|ohm|lo|sur|ber|jah|cham|zod)\s+rune\b",
-    r"(?i)worldstone\s+shard",
+    r"(?i)[oO*\-\.\s=]*worldstone\s+shard[oO*\-\.\s=]*",
     r"(?i)larzuk'?s\s+puzzlebox|puzzlebox",
     r"(?i)larzuk'?s\s+puzzle\s+piece|puzzle\s+piece",
     r"(?i)vial\s+of\s+lightsong",
@@ -131,11 +131,14 @@ class DualRegionDropLogger:
         self.init_csv()
 
     def init_csv(self):
-        """Creates the CSV log file with Area/Location tracking."""
-        if not os.path.exists(LOG_FILE):
-            with open(LOG_FILE, mode='w', newline='', encoding='utf-8') as f:
+        """Creates the CSV log file with Area/Location tracking if it doesn't exist or is empty."""
+        csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), LOG_FILE)
+        needs_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+        if needs_header:
+            with open(csv_path, mode='w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(["Timestamp", "Location / Area", "Matched Item", "Raw OCR Line"])
+            print(f"[Info] Created new drop log file: {csv_path}")
 
     def preprocess_image(self, img_bgra):
         """
@@ -224,11 +227,14 @@ class DualRegionDropLogger:
         print(f"  Area : {self.current_zone}")
         print(f"  Raw  : '{raw_line}'\n")
         
-        with open(LOG_FILE, mode='a', newline='', encoding='utf-8') as f:
+        self.init_csv()
+        csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), LOG_FILE)
+        with open(csv_path, mode='a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([timestamp_str, self.current_zone, normalized_item, raw_line])
 
     def run(self):
+        self.init_csv()
         print("Starting Diablo II Dual-Region Drop Logger (HSV Color Masking Active)...")
         print(f"Watching Drops (Left) : {DROP_REGION}")
         print(f"Watching Area (Right) : {ZONE_REGION}")
