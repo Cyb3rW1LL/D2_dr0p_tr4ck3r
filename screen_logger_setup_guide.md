@@ -23,5 +23,10 @@ pip install -r requirements.txt
   3. Open the newly generated `debug_raw_capture.png` image.
   4. Adjust `top`, `left`, `width`, and `height` in `MONITOR_REGION` until the image tightly frames your message block.
 
-## 4. Why Stash/Inventory Won't Trigger False Positives
+## 4. Go Binary Compilation
+1. Cd into your target file directory where your go.mod and main.go live along with your d2_screen_logger.py live.
+2. Type `go build -ldflags="-H windowsgui" -o D2DropManager.exe` in powershell or otherwise.
+3. Double click the new `D2DropManager` binary.
+
+## 5. Why Stash/Inventory Won't Trigger False Positives
 Because the script *only* captures the small `MONITOR_REGION` rectangle at the top of your screen, opening your stash, cube, or inventory will never trigger fake drop logs.
