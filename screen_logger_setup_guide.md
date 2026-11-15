@@ -30,3 +30,9 @@ pip install -r requirements.txt
 
 ## 5. Why Stash/Inventory Won't Trigger False Positives
 Because the script *only* captures the small `MONITOR_REGION` rectangle at the top of your screen, opening your stash, cube, or inventory will never trigger fake drop logs.
+
+## 6. Once running, if you need to stop or restart the binary:
+1. In your terminal `taskkill /F /IM D2DropManager.exe 2>$null`
+2. Make edits or changes.
+3. Recompile the new `go.main` binary.
+4. `.\D2DropManager.exe` to run it.
