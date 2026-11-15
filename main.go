@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -15,45 +16,41 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
-// DropRecord represents one row from my_d2_drops.csv
+// DropRecord represents a single recorded drop entry from the CSV
 type DropRecord struct {
-	Timestamp string `json:"timestamp"`
-	Area      string `json:"area"`
-	Item      string `json:"item"`
-	Raw       string `json:"raw"`
+	Timestamp   string `json:"timestamp"`
+	Location    string `json:"location"`
+	MatchedItem string `json:"matched_item"`
+	RawLine     string `json:"raw_line"`
 }
 
-// MetricsSummary calculates aggregated analytics for the UI
-type MetricsSummary struct {
-	TotalDrops     int            `json:"total_drops"`
-	RunesCount     int            `json:"runes_count"`
-	HighRunesCount int            `json:"high_runes_count"`
-	ShardsCount    int            `json:"shards_count"`
-	PuzzleCount    int            `json:"puzzle_count"`
-	KeysCount      int            `json:"keys_count"`
-	OtherCount     int            `json:"other_count"`
-	DropsPerDay    map[string]int `json:"drops_per_day"`
-	TopLocations   []StatPair     `json:"top_locations"`
-	TopItems       []StatPair     `json:"top_items"`
-	Velocity       VelocityStats  `json:"velocity"`
-}
-
-type StatPair struct {
-	Name  string `json:"name"`
-	Count int    `json:"count"`
-}
-
+// VelocityStats holds total counts and hourly drop rates
 type VelocityStats struct {
-	TotalPerHour     float64 `json:"total_per_hour"`
-	RunesPerHour     float64 `json:"runes_per_hour"`
-	HighRunesPerHour float64 `json:"high_runes_per_hour"`
-	ShardsPerHour    float64 `json:"shards_per_hour"`
-	KeysPerHour      float64 `json:"keys_per_hour"`
-	ActiveHours      float64 `json:"active_hours"`
+	Total      int     `json:"total"`
+	PerHour    float64 `json:"per_hour"`
+	Percentage float64 `json:"percentage"`
+}
+
+// LocationStat holds drop count and velocity for a specific zone
+type LocationStat struct {
+	Name    string  `json:"name"`
+	Count   int     `json:"count"`
+	PerHour float64 `json:"per_hour"`
+}
+
+// MetricsSummary encapsulates all calculated dashboard analytics
+type MetricsSummary struct {
+	TotalDrops    VelocityStats  `json:"total_drops"`
+	RunesFound    VelocityStats  `json:"runes_found"`
+	HighRunes     VelocityStats  `json:"high_runes"`
+	WSSFound      VelocityStats  `json:"wss_found"`
+	KeysFound     VelocityStats  `json:"keys_found"`
+	PuzzleFound   VelocityStats  `json:"puzzle_found"`
+	TopLocations  []LocationStat `json:"top_locations"`
+	CategoryBreak map[string]int `json:"category_break"`
 }
 
 // AppState manages the Python child process and live console output
@@ -80,14 +77,8 @@ func (s *AppState) addLog(line string) {
 	}
 }
 
-// getTargetDir reliably resolves to C:\Users\<username>\Desktop\tesseract or the executable folder
-func getTargetDir() string {
-	if home, err := os.UserHomeDir(); err == nil {
-		desktopTesseract := filepath.Join(home, "Desktop", "tesseract")
-		if _, err := os.Stat(filepath.Join(desktopTesseract, "d2_screen_logger.py")); err == nil {
-			return desktopTesseract
-		}
-	}
+// getExeDir returns the absolute directory where D2DropManager.exe or main.go runs
+func getExeDir() string {
 	if exe, err := os.Executable(); err == nil {
 		dir := filepath.Dir(exe)
 		if _, err := os.Stat(filepath.Join(dir, "d2_screen_logger.py")); err == nil {
@@ -95,102 +86,206 @@ func getTargetDir() string {
 		}
 	}
 	if cwd, err := os.Getwd(); err == nil {
-		return cwd
+		if _, err := os.Stat(filepath.Join(cwd, "d2_screen_logger.py")); err == nil {
+			return cwd
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		tessDir := filepath.Join(home, "Desktop", "tesseract")
+		if _, err := os.Stat(tessDir); err == nil {
+			return tessDir
+		}
+		return tessDir
 	}
 	return "."
 }
 
-// findPythonCmd resolves the available Python executable on Windows
-func findPythonCmd() string {
-	for _, bin := range []string{"python", "py", "python3"} {
-		if path, err := exec.LookPath(bin); err == nil {
-			return path
-		}
-	}
-	return "python"
+func getCSVPath() string {
+	return filepath.Join(getExeDir(), "my_d2_drops.csv")
 }
 
-func (s *AppState) startPython() error {
-	s.mu.Lock()
-	if s.running && s.cmd != nil && s.cmd.Process != nil {
-		if err := s.cmd.Process.Signal(syscall.Signal(0)); err == nil && runtime.GOOS != "windows" {
-			s.mu.Unlock()
-			return fmt.Errorf("logger is already running")
-		}
-		if s.cmd.ProcessState != nil {
-			s.running = false
-			s.cmd = nil
-		} else if runtime.GOOS == "windows" {
-			out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", s.cmd.Process.Pid), "/NH").Output()
-			if err == nil && strings.Contains(string(out), fmt.Sprintf("%d", s.cmd.Process.Pid)) {
-				s.mu.Unlock()
-				return fmt.Errorf("logger is already running")
-			}
-			s.running = false
-			s.cmd = nil
+func readDropsCSV() []DropRecord {
+	path := getCSVPath()
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return []DropRecord{}
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return []DropRecord{}
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	reader.LazyQuotes = true
+	reader.FieldsPerRecord = -1
+
+	rows, err := reader.ReadAll()
+	if err != nil || len(rows) == 0 {
+		return []DropRecord{}
+	}
+
+	var records []DropRecord
+	startIndex := 0
+	if len(rows) > 0 && len(rows[0]) > 0 {
+		h0 := strings.ToLower(strings.TrimSpace(rows[0][0]))
+		if strings.Contains(h0, "timestamp") || strings.Contains(h0, "date") {
+			startIndex = 1
 		}
 	}
 
-	workDir := getTargetDir()
-	scriptPath := filepath.Join(workDir, "d2_screen_logger.py")
-	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
-		s.mu.Unlock()
-		errMsg := fmt.Sprintf("[Manager Error] Could not find d2_screen_logger.py in %s", workDir)
-		s.addLog(errMsg)
-		return fmt.Errorf("%s", errMsg)
+	for i := len(rows) - 1; i >= startIndex; i-- {
+		row := rows[i]
+		if len(row) >= 4 {
+			records = append(records, DropRecord{
+				Timestamp:   strings.TrimSpace(row[0]),
+				Location:    strings.TrimSpace(row[1]),
+				MatchedItem: strings.TrimSpace(row[2]),
+				RawLine:     strings.TrimSpace(row[3]),
+			})
+		}
+	}
+	return records
+}
+
+// Enforce explicit capitalization for Lo vs Io so lowercase "lo" (misread Io) never counts as a High Rune
+var highRuneRegex = regexp.MustCompile(`(?i)\b(pul|um|mal|ist|gul|vex|ohm|sur|ber|jah|cham|zod)\s+rune\b|\b(?:Lo|LO)\s+(?:Rune|RUNE|rune)\b`)
+var runeRegex = regexp.MustCompile(`(?i)\b(el|eld|tir|nef|eth|ith|tal|ral|ort|thul|amn|sol|shael|dol|hel|lum|ko|fal|lem|pul|um|mal|ist|gul|vex|ohm|sur|ber|jah|cham|zod)\s+rune\b|\b(?:Io|IO|Lo|LO)\s+(?:Rune|RUNE|rune)\b`)
+var wssRegex = regexp.MustCompile(`(?i)worldstone\s+shard`)
+var keyRegex = regexp.MustCompile(`(?i)key\s+of\s+(terror|hate|destruction)`)
+var puzzleRegex = regexp.MustCompile(`(?i)puzzlebox|puzzle\s+piece`)
+
+func sortMapToPairs(m map[string]int, limit int) []LocationStat {
+	var pairs []LocationStat
+	for k, v := range m {
+		pairs = append(pairs, LocationStat{Name: k, Count: v})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Count == pairs[j].Count {
+			return pairs[i].Name < pairs[j].Name
+		}
+		return pairs[i].Count > pairs[j].Count
+	})
+	if limit > 0 && len(pairs) > limit {
+		pairs = pairs[:limit]
+	}
+	return pairs
+}
+
+func calculateMetrics(drops []DropRecord) MetricsSummary {
+	total := len(drops)
+	var runes, highRunes, wss, keys, puzzle int
+	locMap := make(map[string]int)
+
+	firstTime := time.Now()
+	lastTime := time.Now()
+
+	if total > 0 {
+		if t, err := time.Parse("2006-01-02 15:04:05", drops[len(drops)-1].Timestamp); err == nil {
+			firstTime = t
+		}
+		if t, err := time.Parse("2006-01-02 15:04:05", drops[0].Timestamp); err == nil {
+			lastTime = t
+		}
 	}
 
-	pyBin := findPythonCmd()
-	cmd := exec.Command(pyBin, "-u", scriptPath)
-	cmd.Dir = workDir
+	hours := lastTime.Sub(firstTime).Hours()
+	if hours < 0.25 {
+		hours = 0.25
+	}
 
+	for _, d := range drops {
+		// Check MatchedItem primarily so OCR noise in RawLine doesn't trigger a second match
+		targetText := strings.TrimSpace(d.MatchedItem)
+		if targetText == "" {
+			targetText = d.RawLine
+		}
+
+		loc := d.Location
+		if loc == "" {
+			loc = "Unknown Area"
+		}
+		locMap[loc]++
+
+		if runeRegex.MatchString(targetText) {
+			runes++
+		}
+		if highRuneRegex.MatchString(targetText) {
+			highRunes++
+		}
+		if wssRegex.MatchString(targetText) {
+			wss++
+		}
+		if keyRegex.MatchString(targetText) {
+			keys++
+		}
+		if puzzleRegex.MatchString(targetText) {
+			puzzle++
+		}
+	}
+
+	calcStat := func(count int) VelocityStats {
+		pct := 0.0
+		if total > 0 {
+			pct = (float64(count) / float64(total)) * 100
+		}
+		return VelocityStats{
+			Total:      count,
+			PerHour:    float64(count) / hours,
+			Percentage: pct,
+		}
+	}
+
+	rawTop := sortMapToPairs(locMap, 10)
+	topLocs := make([]LocationStat, 0, len(rawTop))
+	for _, l := range rawTop {
+		topLocs = append(topLocs, LocationStat{
+			Name:    l.Name,
+			Count:   l.Count,
+			PerHour: float64(l.Count) / hours,
+		})
+	}
+
+	return MetricsSummary{
+		TotalDrops:   calcStat(total),
+		RunesFound:   calcStat(runes),
+		HighRunes:    calcStat(highRunes),
+		WSSFound:     calcStat(wss),
+		KeysFound:    calcStat(keys),
+		PuzzleFound:  calcStat(puzzle),
+		TopLocations: topLocs,
+		CategoryBreak: map[string]int{
+			"Runes":        runes,
+			"High Runes":   highRunes,
+			"WSS":          wss,
+			"Keys":         keys,
+			"Puzzle Boxes": puzzle,
+		},
+	}
+}
+
+func findPythonCmd() (string, error) {
+	candidates := []string{"python", "py", "python3"}
+	for _, cand := range candidates {
+		if path, err := exec.LookPath(cand); err == nil {
+			return path, nil
+		}
+	}
 	if runtime.GOOS == "windows" {
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		s.mu.Unlock()
-		s.addLog(fmt.Sprintf("[Manager Error] StdoutPipe failed: %v", err))
-		return err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		s.mu.Unlock()
-		s.addLog(fmt.Sprintf("[Manager Error] StderrPipe failed: %v", err))
-		return err
-	}
-
-	if err := cmd.Start(); err != nil {
-		s.mu.Unlock()
-		errMsg := fmt.Sprintf("[Manager Error] Failed to start Python (%s): %v", pyBin, err)
-		s.addLog(errMsg)
-		return fmt.Errorf("%s", errMsg)
-	}
-
-	s.cmd = cmd
-	s.running = true
-	s.mu.Unlock()
-
-	s.addLog(fmt.Sprintf("[Manager] Started d2_screen_logger.py using %s in %s...", filepath.Base(pyBin), workDir))
-
-	go s.streamOutput(stdout)
-	go s.streamOutput(stderr)
-
-	go func() {
-		err := cmd.Wait()
-		s.mu.Lock()
-		s.running = false
-		s.cmd = nil
-		s.mu.Unlock()
-		if err != nil {
-			s.addLog(fmt.Sprintf("[Manager] Logger stopped (%v).", err))
-		} else {
-			s.addLog("[Manager] Logger stopped cleanly.")
+		winCandidates := []string{
+			`C:\Program Files\Python313\python.exe`,
+			`C:\Program Files\Python312\python.exe`,
+			`C:\Program Files\Python311\python.exe`,
+			`C:\Program Files\Python310\python.exe`,
+			`C:\Program Files\Python39\python.exe`,
 		}
-	}()
-
-	return nil
+		for _, wc := range winCandidates {
+			if _, err := os.Stat(wc); err == nil {
+				return wc, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no python executable found in system PATH")
 }
 
 func (s *AppState) streamOutput(r io.Reader) {
@@ -199,177 +294,442 @@ func (s *AppState) streamOutput(r io.Reader) {
 		s.addLog(scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
-		s.addLog(fmt.Sprintf("[Manager Warning] Output stream read error: %v", err))
+		s.addLog(fmt.Sprintf("[Manager] Pipe stream warning: %v", err))
 	}
+}
+
+func (s *AppState) startPython() error {
+	s.mu.Lock()
+	if s.running && s.cmd != nil && s.cmd.Process != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("logger is already running")
+	}
+	s.mu.Unlock()
+
+	pyBin, err := findPythonCmd()
+	if err != nil {
+		return err
+	}
+
+	workDir := getExeDir()
+	scriptPath := filepath.Join(workDir, "d2_screen_logger.py")
+	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+		return fmt.Errorf("d2_screen_logger.py not found in %s", workDir)
+	}
+
+	var cmd *exec.Cmd
+	if strings.EqualFold(filepath.Base(pyBin), "py.exe") || filepath.Base(pyBin) == "py" {
+		cmd = exec.Command(pyBin, "-3", "d2_screen_logger.py")
+	} else {
+		cmd = exec.Command(pyBin, "d2_screen_logger.py")
+	}
+	cmd.Dir = workDir
+	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1")
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start python process: %v", err)
+	}
+
+	s.mu.Lock()
+	s.cmd = cmd
+	s.running = true
+	currentCmd := cmd
+	s.mu.Unlock()
+
+	s.addLog(fmt.Sprintf("[Manager] Started d2_screen_logger.py using %s in %s...", filepath.Base(pyBin), workDir))
+
+	go s.streamOutput(stdout)
+	go s.streamOutput(stderr)
+
+	go func() {
+		err := currentCmd.Wait()
+		s.mu.Lock()
+		wasCurrent := (s.cmd == currentCmd)
+		if wasCurrent {
+			s.running = false
+			s.cmd = nil
+		}
+		s.mu.Unlock()
+
+		if wasCurrent {
+			if err != nil {
+				s.addLog(fmt.Sprintf("[Manager] Logger stopped (%v).", err))
+			} else {
+				s.addLog("[Manager] Logger stopped cleanly.")
+			}
+		}
+	}()
+
+	return nil
 }
 
 func (s *AppState) stopPython() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.running || s.cmd == nil || s.cmd.Process == nil {
-		s.running = false
-		s.cmd = nil
-		return
-	}
-
-	if runtime.GOOS == "windows" {
-		_ = exec.Command("taskkill", "/f", "/t", "/pid", fmt.Sprintf("%d", s.cmd.Process.Pid)).Run()
-	} else {
-		_ = s.cmd.Process.Kill()
-	}
-
+	cmdToStop := s.cmd
 	s.running = false
 	s.cmd = nil
-	s.addLog("[Manager] Logger stopped by user.")
-}
+	s.mu.Unlock()
 
-func readDropsCSV() []DropRecord {
-	csvPath := filepath.Join(getTargetDir(), "my_d2_drops.csv")
-	file, err := os.Open(csvPath)
-	if err != nil {
-		return []DropRecord{}
-	}
-	defer file.Close()
-
-	reader := csv.NewReader(file)
-	reader.FieldsPerRecord = -1
-	reader.LazyQuotes = true
-	rows, err := reader.ReadAll()
-	if err != nil || len(rows) == 0 {
-		return []DropRecord{}
-	}
-
-	startIdx := 0
-	if len(rows[0]) > 0 && strings.EqualFold(strings.TrimSpace(rows[0][0]), "timestamp") {
-		startIdx = 1
-	}
-
-	var records []DropRecord
-	for i := len(rows) - 1; i >= startIdx; i-- {
-		row := rows[i]
-		if len(row) >= 3 {
-			raw := ""
-			if len(row) >= 4 {
-				raw = strings.Join(row[3:], ",")
-			}
-			records = append(records, DropRecord{
-				Timestamp: strings.TrimSpace(row[0]),
-				Area:      strings.TrimSpace(row[1]),
-				Item:      strings.TrimSpace(row[2]),
-				Raw:       raw,
-			})
-		}
-	}
-	return records
-}
-
-func calculateMetrics(drops []DropRecord) MetricsSummary {
-	metrics := MetricsSummary{
-		TotalDrops:   len(drops),
-		DropsPerDay:  make(map[string]int),
-		TopLocations: []StatPair{},
-		TopItems:     []StatPair{},
-	}
-
-	locMap := make(map[string]int)
-	itemMap := make(map[string]int)
-
-	var firstTime, lastTime time.Time
-	hasValidTime := false
-	highRuneRegex := regexp.MustCompile(`(?i)\b(pul|um|mal|ist|gul|vex|ohm|lo|sur|ber|jah|cham|zod)\s+rune\b`)
-
-	for _, d := range drops {
-		itemLower := strings.ToLower(d.Item)
-		if strings.Contains(itemLower, "rune") {
-			metrics.RunesCount++
-			if highRuneRegex.MatchString(d.Item) {
-				metrics.HighRunesCount++
-			}
-		} else if strings.Contains(itemLower, "worldstone shard") {
-			metrics.ShardsCount++
-		} else if strings.Contains(itemLower, "puzzle") || strings.Contains(itemLower, "mirror") || strings.Contains(itemLower, "lightsong") {
-			metrics.PuzzleCount++
-		} else if strings.Contains(itemLower, "key of") {
-			metrics.KeysCount++
+	if cmdToStop != nil && cmdToStop.Process != nil {
+		if runtime.GOOS == "windows" {
+			_ = exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", cmdToStop.Process.Pid)).Run()
 		} else {
-			metrics.OtherCount++
+			_ = cmdToStop.Process.Kill()
 		}
-
-		t, err := time.Parse("2006-01-02 15:04:05", d.Timestamp)
-		if err == nil {
-			if !hasValidTime {
-				firstTime = t
-				lastTime = t
-				hasValidTime = true
-			} else {
-				if t.Before(firstTime) {
-					firstTime = t
-				}
-				if t.After(lastTime) {
-					lastTime = t
-				}
-			}
-		}
-
-		if len(d.Timestamp) >= 10 {
-			day := d.Timestamp[:10]
-			metrics.DropsPerDay[day]++
-		}
-
-		area := d.Area
-		if area == "" {
-			area = "Unknown Area"
-		}
-		locMap[area]++
-		itemMap[d.Item]++
+		s.addLog("[Manager] Logger stopped by user.")
 	}
-
-	if hasValidTime && len(drops) > 0 {
-		diffHours := lastTime.Sub(firstTime).Hours()
-		if diffHours < 0.25 {
-			diffHours = 0.25
-		}
-		activeHours := diffHours
-		if len(drops) == 1 {
-			activeHours = 1.0
-		}
-
-		metrics.Velocity = VelocityStats{
-			TotalPerHour:     float64(metrics.TotalDrops) / activeHours,
-			RunesPerHour:     float64(metrics.RunesCount) / activeHours,
-			HighRunesPerHour: float64(metrics.HighRunesCount) / activeHours,
-			ShardsPerHour:    float64(metrics.ShardsCount) / activeHours,
-			KeysPerHour:      float64(metrics.KeysCount) / activeHours,
-			ActiveHours:      activeHours,
-		}
-	}
-
-	metrics.TopLocations = sortMapToPairs(locMap, 10)
-	metrics.TopItems = sortMapToPairs(itemMap, 5)
-
-	return metrics
-}
-
-func sortMapToPairs(m map[string]int, limit int) []StatPair {
-	pairs := make([]StatPair, 0, len(m))
-	for k, v := range m {
-		pairs = append(pairs, StatPair{Name: k, Count: v})
-	}
-	sort.Slice(pairs, func(i, j int) bool {
-		if pairs[i].Count != pairs[j].Count {
-			return pairs[i].Count > pairs[j].Count
-		}
-		return strings.ToLower(pairs[i].Name) < strings.ToLower(pairs[j].Name)
-	})
-	if len(pairs) > limit {
-		pairs = pairs[:limit]
-	}
-	return pairs
 }
 
 func openBrowser(url string) {
-	_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	var err error
+	switch runtime.GOOS {
+	case "windows":
+		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	case "darwin":
+		err = exec.Command("open", url).Start()
+	default:
+		err = exec.Command("xdg-open", url).Start()
+	}
+	if err != nil {
+		fmt.Printf("Please open your browser to: %s\n", url)
+	}
 }
+
+const dashboardHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>D2DropManager Dashboard</title>
+<style>
+  :root, [data-theme="neon"] {
+    --bg-dark: #030704;
+    --card-bg: #08120a;
+    --border: #143d1d;
+    --accent: #39ff14;
+    --accent-hover: #2ce60d;
+    --text-main: #e2fbe6;
+    --text-muted: #68a373;
+    --success: #39ff14;
+    --btn-start-text: #020803;
+    --danger: #ff3b30;
+    --console-bg: #010402;
+    --console-text: #39ff14;
+    --rune-color: #ff8c00;
+  }
+  [data-theme="sanctuary"] {
+    --bg-dark: #0f172a;
+    --card-bg: #1e293b;
+    --border: #334155;
+    --accent: #38bdf8;
+    --accent-hover: #0ea5e9;
+    --text-main: #f8fafc;
+    --text-muted: #94a3b8;
+    --success: #22c55e;
+    --btn-start-text: #ffffff;
+    --danger: #ef4444;
+    --console-bg: #090d16;
+    --console-text: #38bdf8;
+    --rune-color: #fb923c;
+  }
+  [data-theme="hellfire"] {
+    --bg-dark: #120606;
+    --card-bg: #1f0a0a;
+    --border: #4a1515;
+    --accent: #f59e0b;
+    --accent-hover: #d97706;
+    --text-main: #fef2f2;
+    --text-muted: #fca5a5;
+    --success: #10b981;
+    --btn-start-text: #ffffff;
+    --danger: #ef4444;
+    --console-bg: #090202;
+    --console-text: #fbbf24;
+    --rune-color: #ff6b00;
+  }
+  [data-theme="tyrael"] {
+    --bg-dark: #0b0e17;
+    --card-bg: #13192b;
+    --border: #2a3659;
+    --accent: #eab308;
+    --accent-hover: #ca8a04;
+    --text-main: #f8fafc;
+    --text-muted: #93c5fd;
+    --success: #22c55e;
+    --btn-start-text: #ffffff;
+    --danger: #ef4444;
+    --console-bg: #06080f;
+    --console-text: #fde047;
+    --rune-color: #ff8c00;
+  }
+  [data-theme="horadric"] {
+    --bg-dark: #130b1c;
+    --card-bg: #1e122b;
+    --border: #3b2354;
+    --accent: #c084fc;
+    --accent-hover: #a855f7;
+    --text-main: #faf5ff;
+    --text-muted: #d8b4fe;
+    --success: #34d399;
+    --btn-start-text: #061b12;
+    --danger: #f43f5e;
+    --console-bg: #09040f;
+    --console-text: #e879f9;
+    --rune-color: #ff941a;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body { background-color: var(--bg-dark); color: var(--text-main); min-height: 100vh; display: flex; flex-direction: column; transition: background-color 0.2s, color 0.2s; }
+  header { background: var(--card-bg); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+  h1 { font-size: 1.25rem; font-weight: 600; display: flex; align-items: center; gap: 10px; color: var(--accent); }
+  .badge { font-size: 0.75rem; padding: 4px 10px; border-radius: 999px; font-weight: 500; text-transform: uppercase; }
+  .badge.running { background: rgba(57, 255, 20, 0.15); color: var(--success); border: 1px solid var(--success); }
+  .badge.stopped { background: rgba(239, 68, 68, 0.15); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.4); }
+  .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  select.theme-select { background: var(--bg-dark); color: var(--text-main); border: 1px solid var(--border); padding: 7px 12px; border-radius: 6px; font-size: 0.875rem; font-weight: 500; cursor: pointer; outline: none; }
+  select.theme-select:focus { border-color: var(--accent); }
+  button { padding: 8px 16px; border-radius: 6px; font-weight: 600; font-size: 0.875rem; cursor: pointer; border: none; transition: background 0.2s, opacity 0.2s; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .btn-start { background: var(--success); color: var(--btn-start-text); }
+  .btn-start:hover:not(:disabled) { filter: brightness(0.92); }
+  .btn-stop { background: var(--danger); color: white; }
+  .btn-stop:hover:not(:disabled) { filter: brightness(0.92); }
+  .btn-secondary { background: var(--border); color: var(--text-main); }
+  .btn-secondary:hover { filter: brightness(1.15); }
+  main { flex: 1; padding: 24px; max-width: 1400px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
+  .metrics-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 16px; }
+  @media(max-width: 1200px) { .metrics-grid { grid-template-columns: repeat(3, 1fr); } }
+  @media(max-width: 768px) { .metrics-grid { grid-template-columns: 1fr; } }
+  .metric-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+  .metric-title { font-size: 0.8125rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .metric-value { font-size: 1.75rem; font-weight: 700; color: var(--text-main); }
+  .metric-sub { font-size: 0.8125rem; color: var(--accent); display: flex; justify-content: space-between; }
+  .content-split { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  @media(max-width: 900px) { .content-split { grid-template-columns: 1fr; } }
+  .panel { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; height: 420px; overflow: hidden; }
+  .panel-header { padding: 12px 16px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 0.9375rem; display: flex; justify-content: space-between; align-items: center; }
+  .console-box { flex: 1; background: var(--console-bg); color: var(--console-text); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.8125rem; padding: 16px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.4; }
+  .table-container { flex: 1; overflow-y: auto; }
+  table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.875rem; }
+  th, td { padding: 10px 16px; border-bottom: 1px solid var(--border); }
+  th { background: rgba(255,255,255,0.03); color: var(--text-muted); font-weight: 500; position: sticky; top: 0; backdrop-filter: blur(4px); }
+  tr:hover td { background: rgba(255,255,255,0.03); }
+  .rune-item { color: var(--rune-color); font-weight: 700; }
+</style>
+</head>
+<body>
+<header>
+  <h1>
+    <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+    D2DropManager
+  </h1>
+  <div style="display:flex; align-items:center; gap: 12px; flex-wrap: wrap;">
+    <select id="themeSelect" class="theme-select" onchange="setTheme(this.value)" title="Select UI Theme">
+      <option value="neon">Theme: Neon Matrix (Default)</option>
+      <option value="sanctuary">Theme: Sanctuary Slate</option>
+      <option value="hellfire">Theme: Hellfire Crimson</option>
+      <option value="tyrael">Theme: Tyrael Gold</option>
+      <option value="horadric">Theme: Horadric Arcane</option>
+    </select>
+    <div id="statusBadge" class="badge stopped">Stopped</div>
+    <div class="controls">
+      <button id="btnStart" class="btn-start" onclick="api('/api/start')">▶ Start Logger</button>
+      <button id="btnStop" class="btn-stop" onclick="api('/api/stop')" disabled>■ Stop</button>
+      <button class="btn-secondary" onclick="api('/api/open-folder')">📁 Open Folder</button>
+      <button class="btn-secondary" onclick="api('/api/quit')">✕ Exit</button>
+    </div>
+  </div>
+</header>
+<main>
+  <div class="metrics-grid">
+    <div class="metric-card">
+      <div class="metric-title">Total Drops</div>
+      <div id="mTotal" class="metric-value">0</div>
+      <div class="metric-sub"><span id="mTotalHr">0.0 / hr</span><span>100%</span></div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-title">Runes Found</div>
+      <div id="mRunes" class="metric-value">0</div>
+      <div class="metric-sub"><span id="mRunesHr">0.0 / hr</span><span id="mRunesPct">0%</span></div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-title">Mid-High Runes (Pul+)</div>
+      <div id="mHighRunes" class="metric-value">0</div>
+      <div class="metric-sub"><span id="mHighRunesHr">0.0 / hr</span><span id="mHighRunesPct">0%</span></div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-title">Worldstone Shards</div>
+      <div id="mWss" class="metric-value">0</div>
+      <div class="metric-sub"><span id="mWssHr">0.0 / hr</span><span id="mWssPct">0%</span></div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-title">Keys Found</div>
+      <div id="mKeys" class="metric-value">0</div>
+      <div class="metric-sub"><span id="mKeysHr">0.0 / hr</span><span id="mKeysPct">0%</span></div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-title">Puzzle Boxes / Mirrors</div>
+      <div id="mPuzzle" class="metric-value">0</div>
+      <div class="metric-sub"><span id="mPuzzleHr">0.0 / hr</span><span id="mPuzzlePct">0%</span></div>
+    </div>
+  </div>
+
+  <div class="content-split">
+    <div class="panel">
+      <div class="panel-header"><span>Top Drop Locations (Top 10)</span></div>
+      <div class="table-container">
+        <table>
+          <thead><tr><th>Location</th><th>Drops</th><th>Rate</th></tr></thead>
+          <tbody id="locationsTable"><tr><td colspan="3" style="text-align:center; color:var(--text-muted)">No drop locations recorded yet</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-header"><span>Live Scanner Feed</span></div>
+      <div id="consoleBox" class="console-box">Connecting...</div>
+    </div>
+  </div>
+
+  <div class="panel" style="height: 380px;">
+    <div class="panel-header"><span>Recent Drops History</span></div>
+    <div class="table-container">
+      <table>
+        <thead><tr><th>Timestamp</th><th>Location</th><th>Matched Item</th><th>Raw OCR Line</th></tr></thead>
+        <tbody id="dropsTable"><tr><td colspan="4" style="text-align:center; color:var(--text-muted)">No drops recorded yet. Start your game and begin farming!</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+<script>
+  let lastLogSeq = -1;
+
+  async function api(endpoint) {
+    try {
+      const res = await fetch(endpoint, { method: 'POST' });
+      if (!res.ok) {
+        const msg = await res.text();
+        console.error("API Error: " + msg);
+      }
+    } catch (e) {
+      const box = document.getElementById('consoleBox');
+      if (box) {
+        box.textContent += '\n[UI Error] Could not reach local server: ' + e.message;
+        box.scrollTop = box.scrollHeight;
+      }
+    }
+    await refresh();
+  }
+
+  async function refresh() {
+    try {
+      const res = await fetch('/api/status');
+      if (!res.ok) return;
+      const data = await res.json();
+
+      const badge = document.getElementById('statusBadge');
+      const btnStart = document.getElementById('btnStart');
+      const btnStop = document.getElementById('btnStop');
+
+      if (data.running) {
+        badge.textContent = 'Running';
+        badge.className = 'badge running';
+        btnStart.disabled = true;
+        btnStop.disabled = false;
+      } else {
+        badge.textContent = 'Stopped';
+        badge.className = 'badge stopped';
+        btnStart.disabled = false;
+        btnStop.disabled = true;
+      }
+
+      const box = document.getElementById('consoleBox');
+      const seq = data.log_seq !== undefined ? data.log_seq : data.logs.length;
+      if (seq !== lastLogSeq) {
+        box.textContent = data.logs.join('\n');
+        box.scrollTop = box.scrollHeight;
+        lastLogSeq = seq;
+      }
+
+      if (data.metrics) {
+        const m = data.metrics;
+        document.getElementById('mTotal').textContent = m.total_drops.total;
+        document.getElementById('mTotalHr').textContent = m.total_drops.per_hour.toFixed(1) + ' / hr';
+
+        document.getElementById('mRunes').textContent = m.runes_found.total;
+        document.getElementById('mRunesHr').textContent = m.runes_found.per_hour.toFixed(1) + ' / hr';
+        document.getElementById('mRunesPct').textContent = m.runes_found.percentage.toFixed(0) + '%';
+
+        document.getElementById('mHighRunes').textContent = m.high_runes.total;
+        document.getElementById('mHighRunesHr').textContent = m.high_runes.per_hour.toFixed(1) + ' / hr';
+        document.getElementById('mHighRunesPct').textContent = m.high_runes.percentage.toFixed(0) + '%';
+
+        document.getElementById('mWss').textContent = m.wss_found.total;
+        document.getElementById('mWssHr').textContent = m.wss_found.per_hour.toFixed(1) + ' / hr';
+        document.getElementById('mWssPct').textContent = m.wss_found.percentage.toFixed(0) + '%';
+
+        document.getElementById('mKeys').textContent = m.keys_found.total;
+        document.getElementById('mKeysHr').textContent = m.keys_found.per_hour.toFixed(1) + ' / hr';
+        document.getElementById('mKeysPct').textContent = m.keys_found.percentage.toFixed(0) + '%';
+
+        document.getElementById('mPuzzle').textContent = m.puzzle_found.total;
+        document.getElementById('mPuzzleHr').textContent = m.puzzle_found.per_hour.toFixed(1) + ' / hr';
+        document.getElementById('mPuzzlePct').textContent = m.puzzle_found.percentage.toFixed(0) + '%';
+
+        const locTbody = document.getElementById('locationsTable');
+        if (m.top_locations && m.top_locations.length > 0) {
+          locTbody.innerHTML = m.top_locations.map(l => 
+            '<tr><td><strong>' + escapeHtml(l.name) + '</strong></td><td>' + l.count + '</td><td>' + l.per_hour.toFixed(1) + ' / hr</td></tr>'
+          ).join('');
+        } else {
+          locTbody.innerHTML = '<tr><td colspan="3" style="text-align:center; color:var(--text-muted)">No drop locations recorded yet</td></tr>';
+        }
+      }
+
+      const dropTbody = document.getElementById('dropsTable');
+      if (data.drops && data.drops.length > 0) {
+        dropTbody.innerHTML = data.drops.map(d => {
+          const isRune = /\b(el|eld|tir|nef|eth|ith|tal|ral|ort|thul|amn|sol|shael|dol|hel|io|lum|ko|fal|lem|pul|um|mal|ist|gul|vex|ohm|lo|sur|ber|jah|cham|zod)\s+rune\b/i.test(d.matched_item || '');
+          const itemHtml = isRune
+            ? '<span class="rune-item">' + escapeHtml(d.matched_item) + '</span>'
+            : '<strong>' + escapeHtml(d.matched_item) + '</strong>';
+          return '<tr><td>' + escapeHtml(d.timestamp) + '</td><td>' + escapeHtml(d.location) + '</td><td>' + itemHtml + '</td><td style="color:var(--text-muted)">' + escapeHtml(d.raw_line) + '</td></tr>';
+        }).join('');
+      } else {
+        dropTbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color:var(--text-muted)">No drops recorded yet. Start your game and begin farming!</td></tr>';
+      }
+    } catch (e) {}
+  }
+
+  function escapeHtml(str) {
+    return (str || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  function setTheme(themeName) {
+    document.documentElement.setAttribute('data-theme', themeName);
+    try { localStorage.setItem('d2_ui_theme', themeName); } catch (e) {}
+    const sel = document.getElementById('themeSelect');
+    if (sel && sel.value !== themeName) sel.value = themeName;
+  }
+
+  (function initTheme() {
+    let saved = 'neon';
+    try { saved = localStorage.getItem('d2_ui_theme') || 'neon'; } catch (e) {}
+    setTheme(saved);
+  })();
+
+  setInterval(refresh, 1000);
+  refresh();
+</script>
+</body>
+</html>
+`
 
 func main() {
 	mux := http.NewServeMux()
@@ -386,6 +746,7 @@ func main() {
 		resp := map[string]interface{}{
 			"running": state.running,
 			"logs":    state.logs,
+			"log_seq": state.logSeq,
 			"drops":   drops,
 			"metrics": metrics,
 		}
@@ -396,7 +757,8 @@ func main() {
 
 	mux.HandleFunc("/api/start", func(w http.ResponseWriter, r *http.Request) {
 		if err := state.startPython(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			state.addLog(fmt.Sprintf("[Manager Error] %v", err))
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -408,8 +770,20 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/open-folder", func(w http.ResponseWriter, r *http.Request) {
-		targetDir := getTargetDir()
-		_ = exec.Command("explorer", targetDir).Start()
+		dir := getExeDir()
+		var err error
+		switch runtime.GOOS {
+		case "windows":
+			err = exec.Command("explorer", dir).Start()
+		case "darwin":
+			err = exec.Command("open", dir).Start()
+		default:
+			err = exec.Command("xdg-open", dir).Start()
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -422,311 +796,16 @@ func main() {
 		}()
 	})
 
-	addr := "127.0.0.1:48291"
-	url := "http://" + addr
-
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		openBrowser(url)
-	}()
-
-	fmt.Printf("D2 Drop Manager running at %s\n", url)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		fmt.Println("Server error:", err)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
 	}
+
+	port := listener.Addr().(*net.TCPAddr).Port
+	url := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	fmt.Printf("D2DropManager running at %s\n", url)
+	go openBrowser(url)
+
+	_ = http.Serve(listener, mux)
 }
-
-const dashboardHTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PD2 Drop Tracker Manager &amp; Metrics</title>
-<style>
-  :root {
-    --bg: #0e0f12;
-    --card: #17191f;
-    --border: #2a2d37;
-    --gold: #c7a86b;
-    --gold-dim: #8c7343;
-    --text: #e6e6e6;
-    --muted: #8b909e;
-    --green: #2ea043;
-    --red: #da3633;
-    --orange: #e0823d;
-    --purple: #a371f7;
-    --blue: #58a6ff;
-  }
-  * { box-sizing: border-box; font-family: 'Segoe UI', system-ui, sans-serif; }
-  body { background: var(--bg); color: var(--text); margin: 0; padding: 24px; }
-  .container { max-width: 1300px; margin: 0 auto; }
-  header {
-    display: flex; justify-content: space-between; align-items: center;
-    background: var(--card); border: 1px solid var(--border);
-    padding: 18px 24px; border-radius: 10px; margin-bottom: 20px;
-  }
-  h1 { margin: 0; font-size: 20px; color: var(--gold); letter-spacing: 0.5px; }
-  .subtitle { font-size: 12px; color: var(--muted); margin-top: 4px; }
-  .controls { display: flex; gap: 10px; align-items: center; }
-  .badge {
-    padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 700;
-    text-transform: uppercase; letter-spacing: 0.5px; margin-right: 8px;
-  }
-  .badge.on { background: rgba(46, 160, 67, 0.2); color: #3fb950; border: 1px solid #2ea043; }
-  .badge.off { background: rgba(218, 54, 51, 0.15); color: #f85149; border: 1px solid #da3633; }
-  button {
-    border: none; padding: 10px 16px; border-radius: 6px; font-weight: 600;
-    cursor: pointer; font-size: 13px; transition: opacity 0.15s;
-  }
-  button:hover { opacity: 0.88; }
-  button:disabled { opacity: 0.4; cursor: not-allowed; }
-  .btn-start { background: var(--green); color: #fff; }
-  .btn-stop { background: var(--red); color: #fff; }
-  .btn-sec { background: #262933; color: var(--text); border: 1px solid var(--border); }
-  
-  /* Metrics Bar */
-  .metrics-grid {
-    display: grid; grid-template-columns: repeat(6, 1fr); gap: 15px; margin-bottom: 20px;
-  }
-  @media (max-width: 1150px) { .metrics-grid { grid-template-columns: repeat(3, 1fr); } }
-  @media (max-width: 650px) { .metrics-grid { grid-template-columns: repeat(2, 1fr); } }
-  .metric-card {
-    background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px;
-    display: flex; flex-direction: column;
-  }
-  .metric-title { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
-  .metric-value { font-size: 24px; font-weight: 700; color: var(--gold); margin-top: 6px; }
-  .metric-sub { font-size: 11px; color: var(--muted); margin-top: 4px; }
-
-  .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }
-  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
-  
-  .card {
-    background: var(--card); border: 1px solid var(--border);
-    border-radius: 10px; padding: 18px; display: flex; flex-direction: column;
-  }
-  .card-header {
-    display: flex; justify-content: space-between; align-items: center;
-    margin-bottom: 12px; border-bottom: 1px solid var(--border); padding-bottom: 10px;
-  }
-  .card-title { font-size: 14px; font-weight: 700; color: var(--gold); text-transform: uppercase; }
-  .console {
-    background: #090a0c; border: 1px solid var(--border); border-radius: 6px;
-    padding: 12px; height: 380px; overflow-y: auto; font-family: 'Consolas', monospace;
-    font-size: 12px; line-height: 1.5; color: #b8c0cc; white-space: pre-wrap;
-  }
-  .table-wrap { height: 380px; overflow-y: auto; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th {
-    text-align: left; padding: 10px; background: #121419; color: var(--muted);
-    position: sticky; top: 0; border-bottom: 1px solid var(--border);
-  }
-  td { padding: 10px; border-bottom: 1px solid #22252e; }
-  .item-pill { color: var(--orange); font-weight: 700; }
-  .area-tag { background: #232732; padding: 3px 8px; border-radius: 4px; font-size: 12px; color: #d0d7de; }
-  
-  .stat-list { display: flex; flex-direction: column; gap: 8px; height: 380px; overflow-y: auto; }
-  .stat-row { display: flex; justify-content: space-between; padding: 8px 12px; background: #121419; border-radius: 6px; font-size: 13px; }
-  .stat-row span:last-child { font-weight: 700; color: var(--gold); }
-</style>
-</head>
-<body>
-<div class="container">
-  <header>
-    <div>
-      <h1>PD2 SEASON 14 DROP MANAGER &amp; METRICS</h1>
-      <div class="subtitle">Real-Time OCR Screen Watcher, CSV Logger &amp; Drop Analytics</div>
-    </div>
-    <div class="controls">
-      <span id="statusBadge" class="badge off">Stopped</span>
-      <button id="btnStart" class="btn-start" onclick="api('/api/start')">Start Logger</button>
-      <button id="btnStop" class="btn-stop" onclick="api('/api/stop')" disabled>Stop</button>
-      <button class="btn-sec" onclick="api('/api/open-folder')">Open Folder</button>
-      <button class="btn-sec" onclick="quitApp()">Exit</button>
-    </div>
-  </header>
-
-  <!-- Metrics Summary Cards -->
-  <div class="metrics-grid">
-    <div class="metric-card">
-      <span class="metric-title">Total Drops</span>
-      <span id="mTotal" class="metric-value">0</span>
-      <span id="vTotal" class="metric-sub">0.0 / hr</span>
-    </div>
-    <div class="metric-card">
-      <span class="metric-title">Runes Found</span>
-      <span id="mRunes" class="metric-value" style="color: var(--orange);">0</span>
-      <span id="vRunes" class="metric-sub">0.0 / hr</span>
-    </div>
-    <div class="metric-card">
-      <span class="metric-title">Mid-High Runes (Pul+)</span>
-      <span id="mHighRunes" class="metric-value" style="color: #ff7b72;">0</span>
-      <span id="vHighRunes" class="metric-sub">0.0 / hr</span>
-    </div>
-    <div class="metric-card">
-      <span class="metric-title">Worldstone Shards</span>
-      <span id="mShards" class="metric-value" style="color: var(--purple);">0</span>
-      <span id="vShards" class="metric-sub">0.0 / hr</span>
-    </div>
-    <div class="metric-card">
-      <span class="metric-title">Keys Found</span>
-      <span id="mKeys" class="metric-value" style="color: var(--gold);">0</span>
-      <span id="vKeys" class="metric-sub">0.0 / hr</span>
-    </div>
-    <div class="metric-card">
-      <span class="metric-title">Puzzle Boxes / Mirrors</span>
-      <span id="mPuzzles" class="metric-value" style="color: var(--blue);">0</span>
-    </div>
-  </div>
-
-  <div class="grid">
-    <!-- Live Console -->
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">Live Scanner Feed</span>
-      </div>
-      <div id="consoleBox" class="console">Connecting...</div>
-    </div>
-
-    <!-- Analytics Breakdown -->
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">Top Drop Locations</span>
-      </div>
-      <div id="topLocationsBox" class="stat-list">
-        <div style="color:var(--muted); text-align:center; padding:20px;">No location data yet.</div>
-      </div>
-    </div>
-
-    <!-- Logged Drops Table -->
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">Drop History</span>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Time</th>
-              <th>Item</th>
-              <th>Area / Map</th>
-            </tr>
-          </thead>
-          <tbody id="dropsBody">
-            <tr><td colspan="3" style="color:var(--muted); text-align:center;">No drops logged yet.</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-</div>
-
-<script>
-  let lastLogCount = 0;
-
-  async function api(endpoint) {
-    try {
-      const res = await fetch(endpoint, { method: 'POST' });
-      if (!res.ok) {
-        const msg = await res.text();
-        console.error("API Error: " + msg);
-      }
-    } catch (e) {
-      const box = document.getElementById('consoleBox');
-      if (box) {
-        box.textContent += '\n[UI Error] Could not reach local server (try refreshing the page): ' + e.message;
-        box.scrollTop = box.scrollHeight;
-      }
-    }
-    refresh();
-  }
-
-  async function quitApp() {
-    await fetch('/api/quit', { method: 'POST' });
-    document.body.innerHTML = "<div style='color:#c7a86b;text-align:center;margin-top:20%;font-family:sans-serif;'><h2>Manager Closed. You can close this browser tab.</h2></div>";
-  }
-
-  async function refresh() {
-    try {
-      const res = await fetch('/api/status');
-      const data = await res.json();
-
-      const badge = document.getElementById('statusBadge');
-      const btnStart = document.getElementById('btnStart');
-      const btnStop = document.getElementById('btnStop');
-      if (data.running) {
-        badge.className = 'badge on';
-        badge.textContent = 'Watching Screen';
-        btnStart.disabled = true;
-        btnStop.disabled = false;
-      } else {
-        badge.className = 'badge off';
-        badge.textContent = 'Stopped';
-        btnStart.disabled = false;
-        btnStop.disabled = true;
-      }
-
-      const box = document.getElementById('consoleBox');
-      if (data.logs.length !== lastLogCount) {
-        box.textContent = data.logs.join('\n');
-        box.scrollTop = box.scrollHeight;
-        lastLogCount = data.logs.length;
-      }
-
-      const m = data.metrics || {};
-      const v = m.velocity || {};
-
-      document.getElementById('mTotal').textContent = m.total_drops || 0;
-      document.getElementById('vTotal').textContent = (v.total_per_hour || 0).toFixed(1) + ' / hr';
-
-      document.getElementById('mRunes').textContent = m.runes_count || 0;
-      document.getElementById('vRunes').textContent = (v.runes_per_hour || 0).toFixed(1) + ' / hr';
-
-      document.getElementById('mHighRunes').textContent = m.high_runes_count || 0;
-      document.getElementById('vHighRunes').textContent = (v.high_runes_per_hour || 0).toFixed(1) + ' / hr';
-
-      document.getElementById('mShards').textContent = m.shards_count || 0;
-      document.getElementById('vShards').textContent = (v.shards_per_hour || 0).toFixed(1) + ' / hr';
-
-      document.getElementById('mKeys').textContent = m.keys_count || 0;
-      document.getElementById('vKeys').textContent = (v.keys_per_hour || 0).toFixed(1) + ' / hr';
-
-      document.getElementById('mPuzzles').textContent = m.puzzle_count || 0;
-
-      const locBox = document.getElementById('topLocationsBox');
-      const locs = m.top_locations || [];
-      if (locs.length === 0) {
-        locBox.innerHTML = '<div style="color:var(--muted); text-align:center; padding:20px;">No location data yet.</div>';
-      } else {
-        locBox.innerHTML = locs.map(l => 
-          '<div class="stat-row"><span>' + escapeHtml(l.name) + '</span><span>' + l.count + ' drops</span></div>'
-        ).join('');
-      }
-
-      const drops = data.drops || [];
-      const tbody = document.getElementById('dropsBody');
-      if (drops.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="3" style="color:var(--muted); text-align:center;">No drops logged yet.</td></tr>';
-      } else {
-        tbody.innerHTML = drops.map(d => 
-          '<tr>' +
-            '<td style="color:var(--muted); font-size:12px;">' + escapeHtml(d.timestamp) + '</td>' +
-            '<td class="item-pill">' + escapeHtml(d.item.toUpperCase()) + '</td>' +
-            '<td><span class="area-tag">' + escapeHtml(d.area) + '</span></td>' +
-          '</tr>'
-        ).join('');
-      }
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
-  function escapeHtml(str) {
-    return str.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-  }
-
-  setInterval(refresh, 1000);
-  refresh();
-</script>
-</body>
-</html>`
