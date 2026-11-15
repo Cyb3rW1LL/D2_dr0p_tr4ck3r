@@ -1,7 +1,7 @@
 <div align="center">
 
 <h1>
-  <img src="assets/diablo.png" alt="Diablo" width="38" align="absmiddle" />
+  <img src="balrog.gif" alt="Diablo" width="38" align="absmiddle" />
   PD2 Loot & Drop Rate Tracker
 </h1>
 
