@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,16 +29,17 @@ type DropRecord struct {
 
 // MetricsSummary calculates aggregated analytics for the UI
 type MetricsSummary struct {
-	TotalDrops   int            `json:"total_drops"`
-	RunesCount   int            `json:"runes_count"`
-	ShardsCount  int            `json:"shards_count"`
-	PuzzleCount  int            `json:"puzzle_count"`
-	KeysCount    int            `json:"keys_count"`
-	OtherCount   int            `json:"other_count"`
-	DropsPerDay  map[string]int `json:"drops_per_day"`
-	TopLocations []StatPair     `json:"top_locations"`
-	TopItems     []StatPair     `json:"top_items"`
-	Velocity     VelocityStats  `json:"velocity"`
+	TotalDrops     int            `json:"total_drops"`
+	RunesCount     int            `json:"runes_count"`
+	HighRunesCount int            `json:"high_runes_count"`
+	ShardsCount    int            `json:"shards_count"`
+	PuzzleCount    int            `json:"puzzle_count"`
+	KeysCount      int            `json:"keys_count"`
+	OtherCount     int            `json:"other_count"`
+	DropsPerDay    map[string]int `json:"drops_per_day"`
+	TopLocations   []StatPair     `json:"top_locations"`
+	TopItems       []StatPair     `json:"top_items"`
+	Velocity       VelocityStats  `json:"velocity"`
 }
 
 type StatPair struct {
@@ -45,11 +48,12 @@ type StatPair struct {
 }
 
 type VelocityStats struct {
-	TotalPerHour  float64 `json:"total_per_hour"`
-	RunesPerHour  float64 `json:"runes_per_hour"`
-	ShardsPerHour float64 `json:"shards_per_hour"`
-	KeysPerHour   float64 `json:"keys_per_hour"`
-	ActiveHours   float64 `json:"active_hours"`
+	TotalPerHour     float64 `json:"total_per_hour"`
+	RunesPerHour     float64 `json:"runes_per_hour"`
+	HighRunesPerHour float64 `json:"high_runes_per_hour"`
+	ShardsPerHour    float64 `json:"shards_per_hour"`
+	KeysPerHour      float64 `json:"keys_per_hour"`
+	ActiveHours      float64 `json:"active_hours"`
 }
 
 // AppState manages the Python child process and live console output
@@ -58,16 +62,19 @@ type AppState struct {
 	cmd     *exec.Cmd
 	running bool
 	logs    []string
+	logSeq  int
 }
 
 var state = &AppState{
-	logs: []string{"[Manager] Ready. Click 'Start Logger' to begin watching Diablo II."},
+	logs:   []string{"[Manager] Ready. Click 'Start Logger' to begin watching Diablo II."},
+	logSeq: 1,
 }
 
 func (s *AppState) addLog(line string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.logs = append(s.logs, line)
+	s.logSeq++
 	if len(s.logs) > 200 {
 		s.logs = s.logs[len(s.logs)-200:]
 	}
@@ -105,9 +112,23 @@ func findPythonCmd() string {
 
 func (s *AppState) startPython() error {
 	s.mu.Lock()
-	if s.running {
-		s.mu.Unlock()
-		return fmt.Errorf("logger is already running")
+	if s.running && s.cmd != nil && s.cmd.Process != nil {
+		if err := s.cmd.Process.Signal(syscall.Signal(0)); err == nil && runtime.GOOS != "windows" {
+			s.mu.Unlock()
+			return fmt.Errorf("logger is already running")
+		}
+		if s.cmd.ProcessState != nil {
+			s.running = false
+			s.cmd = nil
+		} else if runtime.GOOS == "windows" {
+			out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", s.cmd.Process.Pid), "/NH").Output()
+			if err == nil && strings.Contains(string(out), fmt.Sprintf("%d", s.cmd.Process.Pid)) {
+				s.mu.Unlock()
+				return fmt.Errorf("logger is already running")
+			}
+			s.running = false
+			s.cmd = nil
+		}
 	}
 
 	workDir := getTargetDir()
@@ -116,7 +137,7 @@ func (s *AppState) startPython() error {
 		s.mu.Unlock()
 		errMsg := fmt.Sprintf("[Manager Error] Could not find d2_screen_logger.py in %s", workDir)
 		s.addLog(errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	pyBin := findPythonCmd()
@@ -144,7 +165,7 @@ func (s *AppState) startPython() error {
 		s.mu.Unlock()
 		errMsg := fmt.Sprintf("[Manager Error] Failed to start Python (%s): %v", pyBin, err)
 		s.addLog(errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	s.cmd = cmd
@@ -192,7 +213,6 @@ func (s *AppState) stopPython() {
 	}
 
 	if runtime.GOOS == "windows" {
-		// Force kill python process tree on Windows to ensure clean shutdown
 		_ = exec.Command("taskkill", "/f", "/t", "/pid", fmt.Sprintf("%d", s.cmd.Process.Pid)).Run()
 	} else {
 		_ = s.cmd.Process.Kill()
@@ -212,20 +232,31 @@ func readDropsCSV() []DropRecord {
 	defer file.Close()
 
 	reader := csv.NewReader(file)
+	reader.FieldsPerRecord = -1
+	reader.LazyQuotes = true
 	rows, err := reader.ReadAll()
-	if err != nil || len(rows) <= 1 {
+	if err != nil || len(rows) == 0 {
 		return []DropRecord{}
 	}
 
+	startIdx := 0
+	if len(rows[0]) > 0 && strings.EqualFold(strings.TrimSpace(rows[0][0]), "timestamp") {
+		startIdx = 1
+	}
+
 	var records []DropRecord
-	for i := len(rows) - 1; i >= 1; i-- {
+	for i := len(rows) - 1; i >= startIdx; i-- {
 		row := rows[i]
-		if len(row) >= 4 {
+		if len(row) >= 3 {
+			raw := ""
+			if len(row) >= 4 {
+				raw = strings.Join(row[3:], ",")
+			}
 			records = append(records, DropRecord{
-				Timestamp: row[0],
-				Area:      row[1],
-				Item:      row[2],
-				Raw:       row[3],
+				Timestamp: strings.TrimSpace(row[0]),
+				Area:      strings.TrimSpace(row[1]),
+				Item:      strings.TrimSpace(row[2]),
+				Raw:       raw,
 			})
 		}
 	}
@@ -245,11 +276,15 @@ func calculateMetrics(drops []DropRecord) MetricsSummary {
 
 	var firstTime, lastTime time.Time
 	hasValidTime := false
+	highRuneRegex := regexp.MustCompile(`(?i)\b(pul|um|mal|ist|gul|vex|ohm|lo|sur|ber|jah|cham|zod)\s+rune\b`)
 
 	for _, d := range drops {
 		itemLower := strings.ToLower(d.Item)
 		if strings.Contains(itemLower, "rune") {
 			metrics.RunesCount++
+			if highRuneRegex.MatchString(d.Item) {
+				metrics.HighRunesCount++
+			}
 		} else if strings.Contains(itemLower, "worldstone shard") {
 			metrics.ShardsCount++
 		} else if strings.Contains(itemLower, "puzzle") || strings.Contains(itemLower, "mirror") || strings.Contains(itemLower, "lightsong") {
@@ -300,32 +335,32 @@ func calculateMetrics(drops []DropRecord) MetricsSummary {
 		}
 
 		metrics.Velocity = VelocityStats{
-			TotalPerHour:  float64(metrics.TotalDrops) / activeHours,
-			RunesPerHour:  float64(metrics.RunesCount) / activeHours,
-			ShardsPerHour: float64(metrics.ShardsCount) / activeHours,
-			KeysPerHour:   float64(metrics.KeysCount) / activeHours,
-			ActiveHours:   activeHours,
+			TotalPerHour:     float64(metrics.TotalDrops) / activeHours,
+			RunesPerHour:     float64(metrics.RunesCount) / activeHours,
+			HighRunesPerHour: float64(metrics.HighRunesCount) / activeHours,
+			ShardsPerHour:    float64(metrics.ShardsCount) / activeHours,
+			KeysPerHour:      float64(metrics.KeysCount) / activeHours,
+			ActiveHours:      activeHours,
 		}
 	}
 
-	metrics.TopLocations = sortMapToPairs(locMap, 5)
+	metrics.TopLocations = sortMapToPairs(locMap, 10)
 	metrics.TopItems = sortMapToPairs(itemMap, 5)
 
 	return metrics
 }
 
 func sortMapToPairs(m map[string]int, limit int) []StatPair {
-	var pairs []StatPair
+	pairs := make([]StatPair, 0, len(m))
 	for k, v := range m {
 		pairs = append(pairs, StatPair{Name: k, Count: v})
 	}
-	for i := 0; i < len(pairs); i++ {
-		for j := i + 1; j < len(pairs); j++ {
-			if pairs[j].Count > pairs[i].Count {
-				pairs[i], pairs[j] = pairs[j], pairs[i]
-			}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Count != pairs[j].Count {
+			return pairs[i].Count > pairs[j].Count
 		}
-	}
+		return strings.ToLower(pairs[i].Name) < strings.ToLower(pairs[j].Name)
+	})
 	if len(pairs) > limit {
 		pairs = pairs[:limit]
 	}
@@ -451,8 +486,10 @@ const dashboardHTML = `<!DOCTYPE html>
   
   /* Metrics Bar */
   .metrics-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px;
+    display: grid; grid-template-columns: repeat(6, 1fr); gap: 15px; margin-bottom: 20px;
   }
+  @media (max-width: 1150px) { .metrics-grid { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 650px) { .metrics-grid { grid-template-columns: repeat(2, 1fr); } }
   .metric-card {
     background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px;
     display: flex; flex-direction: column;
@@ -497,15 +534,15 @@ const dashboardHTML = `<!DOCTYPE html>
 <div class="container">
   <header>
     <div>
-      <h1>⚔️ PD2 SEASON 14 DROP MANAGER &amp; METRICS</h1>
+      <h1>PD2 SEASON 14 DROP MANAGER &amp; METRICS</h1>
       <div class="subtitle">Real-Time OCR Screen Watcher, CSV Logger &amp; Drop Analytics</div>
     </div>
     <div class="controls">
-      <span id="statusBadge" class="badge off">● Stopped</span>
-      <button id="btnStart" class="btn-start" onclick="api('/api/start')">▶ Start Logger</button>
-      <button id="btnStop" class="btn-stop" onclick="api('/api/stop')" disabled>■ Stop</button>
-      <button class="btn-sec" onclick="api('/api/open-folder')">📂 Open Folder</button>
-      <button class="btn-sec" onclick="quitApp()">✕ Exit</button>
+      <span id="statusBadge" class="badge off">Stopped</span>
+      <button id="btnStart" class="btn-start" onclick="api('/api/start')">Start Logger</button>
+      <button id="btnStop" class="btn-stop" onclick="api('/api/stop')" disabled>Stop</button>
+      <button class="btn-sec" onclick="api('/api/open-folder')">Open Folder</button>
+      <button class="btn-sec" onclick="quitApp()">Exit</button>
     </div>
   </header>
 
@@ -520,6 +557,11 @@ const dashboardHTML = `<!DOCTYPE html>
       <span class="metric-title">Runes Found</span>
       <span id="mRunes" class="metric-value" style="color: var(--orange);">0</span>
       <span id="vRunes" class="metric-sub">0.0 / hr</span>
+    </div>
+    <div class="metric-card">
+      <span class="metric-title">Mid-High Runes (Pul+)</span>
+      <span id="mHighRunes" class="metric-value" style="color: #ff7b72;">0</span>
+      <span id="vHighRunes" class="metric-sub">0.0 / hr</span>
     </div>
     <div class="metric-card">
       <span class="metric-title">Worldstone Shards</span>
@@ -590,7 +632,11 @@ const dashboardHTML = `<!DOCTYPE html>
         console.error("API Error: " + msg);
       }
     } catch (e) {
-      console.error(e);
+      const box = document.getElementById('consoleBox');
+      if (box) {
+        box.textContent += '\n[UI Error] Could not reach local server (try refreshing the page): ' + e.message;
+        box.scrollTop = box.scrollHeight;
+      }
     }
     refresh();
   }
@@ -610,12 +656,12 @@ const dashboardHTML = `<!DOCTYPE html>
       const btnStop = document.getElementById('btnStop');
       if (data.running) {
         badge.className = 'badge on';
-        badge.textContent = '● Watching Screen';
+        badge.textContent = 'Watching Screen';
         btnStart.disabled = true;
         btnStop.disabled = false;
       } else {
         badge.className = 'badge off';
-        badge.textContent = '● Stopped';
+        badge.textContent = 'Stopped';
         btnStart.disabled = false;
         btnStop.disabled = true;
       }
@@ -635,6 +681,9 @@ const dashboardHTML = `<!DOCTYPE html>
 
       document.getElementById('mRunes').textContent = m.runes_count || 0;
       document.getElementById('vRunes').textContent = (v.runes_per_hour || 0).toFixed(1) + ' / hr';
+
+      document.getElementById('mHighRunes').textContent = m.high_runes_count || 0;
+      document.getElementById('vHighRunes').textContent = (v.high_runes_per_hour || 0).toFixed(1) + ' / hr';
 
       document.getElementById('mShards').textContent = m.shards_count || 0;
       document.getElementById('vShards').textContent = (v.shards_per_hour || 0).toFixed(1) + ' / hr';
