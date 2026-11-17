@@ -43,11 +43,15 @@ TOWN_ZONES = {
 }
 
 # 4. Loot Filter Patterns (Regex)
+# Note: Io and Lo use explicit capitalization (Io/IO vs Lo/LO) so Tesseract reading
+# capital 'I' as lowercase 'l' ("lo Rune") never triggers a false Lo Rune!
 DROP_PATTERNS = [
-    r"(?i)\b(el|eld|tir|nef|eth|ith|tal|ral|ort|thul|amn|sol|shael|dol|hel|io|lum|ko|fal|lem|pul|um|mal|ist|gul|vex|ohm|lo|sur|ber|jah|cham|zod)\s+rune\b",
-    r"(?i)[oO*\-\.\s=]*worldstone\s+shard[oO*\-\.\s=]*",
+    r"(?i)\b(el|eld|tir|nef|eth|ith|tal|ral|ort|thul|amn|sol|shael|dol|hel|lum|ko|fal|lem|pul|um|mal|ist|gul|vex|ohm|sur|ber|jah|cham|zod)\s+rune\b",
+    r"\b(?:Io|IO)\s+(?:Rune|RUNE|rune)\b",
+    r"\b(?:Lo|LO)\s+(?:Rune|RUNE|rune)\b",
+    r"(?i)worldstone\s+shard",
     r"(?i)larzuk'?s\s+puzzlebox|puzzlebox",
-    r"(?i)larzuk'?s\s+puzzle\s+piece|puzzle\s+piece",
+    r"(?i)larzuk'?s\s+(?:puzzlepiece|puzzlebox)",
     r"(?i)vial\s+of\s+lightsong",
     r"(?i)lilith'?s\s+mirror",
     r"(?i)key\s+of\s+(terror|hate|destruction)"
@@ -97,7 +101,7 @@ KNOWN_ZONES = [
     # --- PD2 Tier 3 Maps ---
     "Arreat Battlefield", "Bastion Keep", "Blood Moon", "Demon Road",
     "Kehjistan Marketplace", "River of Blood",
-    "Royal Crypts", "Skovos Stronghold", "Kyovoshad",
+    "Royal Crypts", "Skovos Stronghold", "Kyovoshad"
 
     # --- PD2 Tier 4 Dungeons ---
     "Plains of Torment", "Sanctuary of Sin", "Steppes of Daken-Shar",
@@ -126,6 +130,7 @@ SAVE_DEBUG_IMAGES = True # Saves 1 snapshot on startup so you can check both box
 class DualRegionDropLogger:
     def __init__(self):
         self.recent_drops = {}
+        self.last_io_lo_time = 0.0
         self.current_zone = "Unknown Area"
         self.known_zones_lower = {z.lower(): z for z in KNOWN_ZONES}
         self.init_csv()
@@ -146,33 +151,24 @@ class DualRegionDropLogger:
         plus saturated text colors (purple WSS, orange runes, gold uniques, green sets)
         so Tesseract can read colored loot filter notifications reliably.
         """
-        # Drop Alpha channel if present
         if img_bgra.shape[2] == 4:
             bgr = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2BGR)
         else:
             bgr = img_bgra
 
-        # Upscale 2x for cleaner OCR recognition
         h, w = bgr.shape[:2]
         scaled = cv2.resize(bgr, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
-
-        # Convert to HSV color space
         hsv = cv2.cvtColor(scaled, cv2.COLOR_BGR2HSV)
 
-        # Mask 1: Bright White / Light Gray text (standard D2 items & UI)
         lower_white = np.array([0, 0, 160])
         upper_white = np.array([180, 50, 255])
         mask_white = cv2.inRange(hsv, lower_white, upper_white)
 
-        # Mask 2: Saturated Colored text (Purple WSS, Orange runes, Yellow uniques, Green sets)
         lower_color = np.array([0, 80, 120])
         upper_color = np.array([180, 255, 255])
         mask_color = cv2.inRange(hsv, lower_color, upper_color)
 
-        # Combine masks
         combined_mask = cv2.bitwise_or(mask_white, mask_color)
-
-        # Invert so text is solid black on a white background (ideal for Tesseract)
         inverted = cv2.bitwise_not(combined_mask)
         return inverted
 
@@ -185,7 +181,6 @@ class DualRegionDropLogger:
             
             clean_lower = clean.lower()
 
-            # 1. Exact substring match against KNOWN_ZONES
             for known_lower, proper_name in self.known_zones_lower.items():
                 if known_lower in clean_lower:
                     if self.current_zone != proper_name:
@@ -193,7 +188,6 @@ class DualRegionDropLogger:
                         print(f"[Area Changed] -> {self.current_zone}")
                     return
 
-            # 2. Fuzzy match (handles minor OCR typos)
             matches = difflib.get_close_matches(clean_lower, self.known_zones_lower.keys(), n=1, cutoff=0.82)
             if matches:
                 proper_name = self.known_zones_lower[matches[0]]
@@ -207,13 +201,22 @@ class DualRegionDropLogger:
         if self.current_zone in TOWN_ZONES:
             return
 
-        # Normalize any Worldstone Shard variant to a clean standard name for CSV/display
         normalized_item = item_name.strip()
         if "worldstone shard" in normalized_item.lower():
             normalized_item = "Worldstone Shard"
+        elif normalized_item.lower().endswith(" rune"):
+            # Normalize casing (e.g., "IO RUNE" -> "Io Rune", "LO RUNE" -> "Lo Rune")
+            prefix = normalized_item.split()[0].capitalize()
+            normalized_item = f"{prefix} Rune"
 
         now = time.time()
         clean_key = normalized_item.lower().strip()
+
+        # Prevent a single Io/Lo drop from ever logging both Io and Lo across consecutive frames
+        if clean_key in ("io rune", "lo rune"):
+            if now - self.last_io_lo_time < COOLDOWN_SECONDS:
+                return
+            self.last_io_lo_time = now
 
         if clean_key in self.recent_drops:
             if now - self.recent_drops[clean_key] < COOLDOWN_SECONDS:
@@ -245,15 +248,12 @@ class DualRegionDropLogger:
         with mss.mss() as sct:
             first_frame = True
             while True:
-                # 1. Capture both regions
                 drop_shot = np.array(sct.grab(DROP_REGION))
                 zone_shot = np.array(sct.grab(ZONE_REGION))
 
-                # 2. Preprocess both images using HSV color masking
                 drop_proc = self.preprocess_image(drop_shot)
                 zone_proc = self.preprocess_image(zone_shot)
 
-                # Save one-time alignment snapshots on startup
                 if first_frame and SAVE_DEBUG_IMAGES:
                     cv2.imwrite("debug_left_drops_raw.png", drop_shot)
                     cv2.imwrite("debug_left_drops_ocr.png", drop_proc)
@@ -263,11 +263,9 @@ class DualRegionDropLogger:
                     print("[Info] Check both '*_ocr.png' images to verify your colored loot filter text is crisp black on white!\n")
                     first_frame = False
 
-                # 3. Read Top-Right Zone first so any drop on this frame has the latest Area
                 zone_text = pytesseract.image_to_string(zone_proc, config='--psm 6')
                 self.update_current_zone(zone_text)
 
-                # 4. Read Top-Left Drop Messages
                 drop_text = pytesseract.image_to_string(drop_proc, config='--psm 6')
                 for line in drop_text.splitlines():
                     clean_line = line.strip()
@@ -278,6 +276,7 @@ class DualRegionDropLogger:
                         match = re.search(pattern, clean_line)
                         if match:
                             self.log_drop(match.group(0), clean_line)
+                            break
 
                 time.sleep(POLL_INTERVAL)
 
