@@ -49,6 +49,7 @@ type MetricsSummary struct {
 	WSSFound      VelocityStats  `json:"wss_found"`
 	KeysFound     VelocityStats  `json:"keys_found"`
 	PuzzleFound   VelocityStats  `json:"puzzle_found"`
+	MirrorsVials  VelocityStats  `json:"mirrors_vials"`
 	TopLocations  []LocationStat `json:"top_locations"`
 	CategoryBreak map[string]int `json:"category_break"`
 }
@@ -153,7 +154,8 @@ var highRuneRegex = regexp.MustCompile(`(?i)\b(pul|um|mal|ist|gul|vex|ohm|sur|be
 var runeRegex = regexp.MustCompile(`(?i)\b(el|eld|tir|nef|eth|ith|tal|ral|ort|thul|amn|sol|shael|dol|hel|lum|ko|fal|lem|pul|um|mal|ist|gul|vex|ohm|sur|ber|jah|cham|zod)\s+rune\b|\b(?:Io|IO|Lo|LO)\s+(?:Rune|RUNE|rune)\b`)
 var wssRegex = regexp.MustCompile(`(?i)worldstone\s+shard`)
 var keyRegex = regexp.MustCompile(`(?i)key\s+of\s+(terror|hate|destruction)`)
-var puzzleRegex = regexp.MustCompile(`(?i)puzzlebox|puzzle\s+piece`)
+var puzzleRegex = regexp.MustCompile(`(?i)puzzle\s*box|puzzle\s*piece`)
+var mirrorVialRegex = regexp.MustCompile(`(?i)lilith'?s\s+mirror|vial\s+of\s+lightsong`)
 
 func sortMapToPairs(m map[string]int, limit int) []LocationStat {
 	var pairs []LocationStat
@@ -174,7 +176,7 @@ func sortMapToPairs(m map[string]int, limit int) []LocationStat {
 
 func calculateMetrics(drops []DropRecord) MetricsSummary {
 	total := len(drops)
-	var runes, highRunes, wss, keys, puzzle int
+	var runes, highRunes, wss, keys, puzzle, mirrorsVials int
 	locMap := make(map[string]int)
 
 	firstTime := time.Now()
@@ -222,6 +224,9 @@ func calculateMetrics(drops []DropRecord) MetricsSummary {
 		if puzzleRegex.MatchString(targetText) {
 			puzzle++
 		}
+		if mirrorVialRegex.MatchString(targetText) {
+			mirrorsVials++
+		}
 	}
 
 	calcStat := func(count int) VelocityStats {
@@ -253,13 +258,15 @@ func calculateMetrics(drops []DropRecord) MetricsSummary {
 		WSSFound:     calcStat(wss),
 		KeysFound:    calcStat(keys),
 		PuzzleFound:  calcStat(puzzle),
+		MirrorsVials: calcStat(mirrorsVials),
 		TopLocations: topLocs,
 		CategoryBreak: map[string]int{
-			"Runes":        runes,
-			"High Runes":   highRunes,
-			"WSS":          wss,
-			"Keys":         keys,
-			"Puzzle Boxes": puzzle,
+			"Runes":             runes,
+			"High Runes":        highRunes,
+			"WSS":               wss,
+			"Keys":              keys,
+			"Puzzle Box/Pieces": puzzle,
+			"Mirrors / Vials":   mirrorsVials,
 		},
 	}
 }
@@ -503,14 +510,15 @@ const dashboardHTML = `<!DOCTYPE html>
   .btn-stop:hover:not(:disabled) { filter: brightness(0.92); }
   .btn-secondary { background: var(--border); color: var(--text-main); }
   .btn-secondary:hover { filter: brightness(1.15); }
-  main { flex: 1; padding: 24px; max-width: 1400px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
-  .metrics-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 16px; }
-  @media(max-width: 1200px) { .metrics-grid { grid-template-columns: repeat(3, 1fr); } }
-  @media(max-width: 768px) { .metrics-grid { grid-template-columns: 1fr; } }
-  .metric-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
-  .metric-title { font-size: 0.8125rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
-  .metric-value { font-size: 1.75rem; font-weight: 700; color: var(--text-main); }
-  .metric-sub { font-size: 0.8125rem; color: var(--accent); display: flex; justify-content: space-between; }
+  main { flex: 1; padding: 24px; max-width: 1480px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
+  .metrics-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 14px; }
+  @media(max-width: 1300px) { .metrics-grid { grid-template-columns: repeat(4, 1fr); } }
+  @media(max-width: 900px) { .metrics-grid { grid-template-columns: repeat(2, 1fr); } }
+  @media(max-width: 600px) { .metrics-grid { grid-template-columns: 1fr; } }
+  .metric-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+  .metric-title { font-size: 0.775rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .metric-value { font-size: 1.65rem; font-weight: 700; color: var(--text-main); }
+  .metric-sub { font-size: 0.8rem; color: var(--accent); display: flex; justify-content: space-between; }
   .content-split { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
   @media(max-width: 900px) { .content-split { grid-template-columns: 1fr; } }
   .panel { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; height: 420px; overflow: hidden; }
@@ -575,9 +583,14 @@ const dashboardHTML = `<!DOCTYPE html>
       <div class="metric-sub"><span id="mKeysHr">0.0 / hr</span><span id="mKeysPct">0%</span></div>
     </div>
     <div class="metric-card">
-      <div class="metric-title">Puzzle Boxes / Mirrors</div>
+      <div class="metric-title">Puzzle Box / Pieces</div>
       <div id="mPuzzle" class="metric-value">0</div>
       <div class="metric-sub"><span id="mPuzzleHr">0.0 / hr</span><span id="mPuzzlePct">0%</span></div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-title">Mirrors / Vials</div>
+      <div id="mMirrors" class="metric-value">0</div>
+      <div class="metric-sub"><span id="mMirrorsHr">0.0 / hr</span><span id="mMirrorsPct">0%</span></div>
     </div>
   </div>
 
@@ -664,23 +677,27 @@ const dashboardHTML = `<!DOCTYPE html>
 
         document.getElementById('mRunes').textContent = m.runes_found.total;
         document.getElementById('mRunesHr').textContent = m.runes_found.per_hour.toFixed(1) + ' / hr';
-        document.getElementById('mRunesPct').textContent = m.runes_found.percentage.toFixed(0) + '%';
+        document.getElementById('mRunesPct').textContent = m.runes_found.percentage.toFixed(9) + '%';
 
         document.getElementById('mHighRunes').textContent = m.high_runes.total;
         document.getElementById('mHighRunesHr').textContent = m.high_runes.per_hour.toFixed(1) + ' / hr';
-        document.getElementById('mHighRunesPct').textContent = m.high_runes.percentage.toFixed(0) + '%';
+        document.getElementById('mHighRunesPct').textContent = m.high_runes.percentage.toFixed(9) + '%';
 
         document.getElementById('mWss').textContent = m.wss_found.total;
         document.getElementById('mWssHr').textContent = m.wss_found.per_hour.toFixed(1) + ' / hr';
-        document.getElementById('mWssPct').textContent = m.wss_found.percentage.toFixed(0) + '%';
+        document.getElementById('mWssPct').textContent = m.wss_found.percentage.toFixed(9) + '%';
 
         document.getElementById('mKeys').textContent = m.keys_found.total;
         document.getElementById('mKeysHr').textContent = m.keys_found.per_hour.toFixed(1) + ' / hr';
-        document.getElementById('mKeysPct').textContent = m.keys_found.percentage.toFixed(0) + '%';
+        document.getElementById('mKeysPct').textContent = m.keys_found.percentage.toFixed(9) + '%';
 
         document.getElementById('mPuzzle').textContent = m.puzzle_found.total;
         document.getElementById('mPuzzleHr').textContent = m.puzzle_found.per_hour.toFixed(1) + ' / hr';
-        document.getElementById('mPuzzlePct').textContent = m.puzzle_found.percentage.toFixed(0) + '%';
+        document.getElementById('mPuzzlePct').textContent = m.puzzle_found.percentage.toFixed(9) + '%';
+
+        document.getElementById('mMirrors').textContent = m.mirrors_vials.total;
+        document.getElementById('mMirrorsHr').textContent = m.mirrors_vials.per_hour.toFixed(1) + ' / hr';
+        document.getElementById('mMirrorsPct').textContent = m.mirrors_vials.percentage.toFixed(9) + '%';
 
         const locTbody = document.getElementById('locationsTable');
         if (m.top_locations && m.top_locations.length > 0) {
