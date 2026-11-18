@@ -52,6 +52,7 @@ type MetricsSummary struct {
 	MirrorsVials  VelocityStats  `json:"mirrors_vials"`
 	TopLocations  []LocationStat `json:"top_locations"`
 	CategoryBreak map[string]int `json:"category_break"`
+	RuneCounts    map[string]int `json:"rune_counts"`
 }
 
 // AppState manages the Python child process and live console output
@@ -157,6 +158,22 @@ var keyRegex = regexp.MustCompile(`(?i)key\s+of\s+(terror|hate|destruction)`)
 var puzzleRegex = regexp.MustCompile(`(?i)puzzle\s*box|puzzle\s*piece`)
 var mirrorVialRegex = regexp.MustCompile(`(?i)lilith'?s\s+mirror|vial\s+of\s+lightsong`)
 
+func extractRuneName(text string) string {
+	m := runeRegex.FindStringSubmatch(text)
+	if len(m) == 0 {
+		return ""
+	}
+	fields := strings.Fields(m[0])
+	if len(fields) == 0 {
+		return ""
+	}
+	r := strings.ToLower(fields[0])
+	if len(r) == 0 {
+		return ""
+	}
+	return strings.ToUpper(r[:1]) + r[1:]
+}
+
 func sortMapToPairs(m map[string]int, limit int) []LocationStat {
 	var pairs []LocationStat
 	for k, v := range m {
@@ -178,6 +195,7 @@ func calculateMetrics(drops []DropRecord) MetricsSummary {
 	total := len(drops)
 	var runes, highRunes, wss, keys, puzzle, mirrorsVials int
 	locMap := make(map[string]int)
+	runeCounts := make(map[string]int)
 
 	firstTime := time.Now()
 	lastTime := time.Now()
@@ -209,8 +227,9 @@ func calculateMetrics(drops []DropRecord) MetricsSummary {
 		}
 		locMap[loc]++
 
-		if runeRegex.MatchString(targetText) {
+		if rName := extractRuneName(targetText); rName != "" {
 			runes++
+			runeCounts[rName]++
 		}
 		if highRuneRegex.MatchString(targetText) {
 			highRunes++
@@ -268,6 +287,7 @@ func calculateMetrics(drops []DropRecord) MetricsSummary {
 			"Puzzle Box/Pieces": puzzle,
 			"Mirrors / Vials":   mirrorsVials,
 		},
+		RuneCounts: runeCounts,
 	}
 }
 
@@ -492,6 +512,81 @@ const dashboardHTML = `<!DOCTYPE html>
     --console-text: #e879f9;
     --rune-color: #ff941a;
   }
+  [data-theme="bloodmoor"] {
+    --bg-dark: #0d0507;
+    --card-bg: #1a0a0e;
+    --border: #4d1622;
+    --accent: #e11d48;
+    --accent-hover: #be123c;
+    --text-main: #f5ebe0;
+    --text-muted: #c996a0;
+    --success: #22c55e;
+    --btn-start-text: #ffffff;
+    --danger: #f43f5e;
+    --console-bg: #070203;
+    --console-text: #fb7185;
+    --rune-color: #ff8c00;
+  }
+  [data-theme="mephisto"] {
+    --bg-dark: #050d0a;
+    --card-bg: #0b1a14;
+    --border: #174734;
+    --accent: #10b981;
+    --accent-hover: #059669;
+    --text-main: #ecfdf5;
+    --text-muted: #6ee7b7;
+    --success: #34d399;
+    --btn-start-text: #02140d;
+    --danger: #ef4444;
+    --console-bg: #020805;
+    --console-text: #34d399;
+    --rune-color: #ff941a;
+  }
+  [data-theme="worldstone"] {
+    --bg-dark: #070c14;
+    --card-bg: #0e1726;
+    --border: #233859;
+    --accent: #7dd3fc;
+    --accent-hover: #38bdf8;
+    --text-main: #f0f9ff;
+    --text-muted: #93c5fd;
+    --success: #38bdf8;
+    --btn-start-text: #04101c;
+    --danger: #ef4444;
+    --console-bg: #03060a;
+    --console-text: #bae6fd;
+    --rune-color: #fbbf24;
+  }
+  [data-theme="chaos"] {
+    --bg-dark: #0f0704;
+    --card-bg: #1c0d07;
+    --border: #54220e;
+    --accent: #f97316;
+    --accent-hover: #ea580c;
+    --text-main: #fff7ed;
+    --text-muted: #fdba74;
+    --success: #22c55e;
+    --btn-start-text: #ffffff;
+    --danger: #dc2626;
+    --console-bg: #080301;
+    --console-text: #fb923c;
+    --rune-color: #facc15;
+  }
+  [data-theme="tristram"] {
+    --bg-dark: #12100d;
+    --card-bg: #1f1b16;
+    --border: #473d31;
+    --accent: #d97706;
+    --accent-hover: #b45309;
+    --text-main: #f5f0e6;
+    --text-muted: #b8ab96;
+    --success: #65a30d;
+    --btn-start-text: #ffffff;
+    --danger: #dc2626;
+    --console-bg: #0a0807;
+    --console-text: #fbbf24;
+    --rune-color: #ff8c00;
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   body { background-color: var(--bg-dark); color: var(--text-main); min-height: 100vh; display: flex; flex-direction: column; transition: background-color 0.2s, color 0.2s; }
   header { background: var(--card-bg); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
@@ -502,7 +597,7 @@ const dashboardHTML = `<!DOCTYPE html>
   .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   select.theme-select { background: var(--bg-dark); color: var(--text-main); border: 1px solid var(--border); padding: 7px 12px; border-radius: 6px; font-size: 0.875rem; font-weight: 500; cursor: pointer; outline: none; }
   select.theme-select:focus { border-color: var(--accent); }
-  button { padding: 8px 16px; border-radius: 6px; font-weight: 600; font-size: 0.875rem; cursor: pointer; border: none; transition: background 0.2s, opacity 0.2s; }
+  button { padding: 8px 16px; border-radius: 6px; font-weight: 600; font-size: 0.875rem; cursor: pointer; border: none; transition: background 0.2s, opacity 0.2s, border-color 0.2s; }
   button:disabled { opacity: 0.45; cursor: not-allowed; }
   .btn-start { background: var(--success); color: var(--btn-start-text); }
   .btn-start:hover:not(:disabled) { filter: brightness(0.92); }
@@ -510,6 +605,8 @@ const dashboardHTML = `<!DOCTYPE html>
   .btn-stop:hover:not(:disabled) { filter: brightness(0.92); }
   .btn-secondary { background: var(--border); color: var(--text-main); }
   .btn-secondary:hover { filter: brightness(1.15); }
+  .btn-rune-toggle { background: var(--bg-dark); color: var(--rune-color); border: 1px solid var(--rune-color); }
+  .btn-rune-toggle:hover, .btn-rune-toggle.active { background: var(--rune-color); color: #050505; }
   main { flex: 1; padding: 24px; max-width: 1480px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
   .metrics-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 14px; }
   @media(max-width: 1300px) { .metrics-grid { grid-template-columns: repeat(4, 1fr); } }
@@ -530,6 +627,149 @@ const dashboardHTML = `<!DOCTYPE html>
   th { background: rgba(255,255,255,0.03); color: var(--text-muted); font-weight: 500; position: sticky; top: 0; backdrop-filter: blur(4px); }
   tr:hover td { background: rgba(255,255,255,0.03); }
   .rune-item { color: var(--rune-color); font-weight: 700; }
+
+  /* Draggable Pop-Out Rune Map */
+  .rune-popover {
+    position: fixed;
+    top: 84px;
+    right: 28px;
+    width: 468px;
+    max-width: calc(100vw - 32px);
+    background: var(--card-bg);
+    border: 2px solid var(--accent);
+    border-radius: 10px;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.85);
+    z-index: 9999;
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .rune-popover.open { display: flex; }
+  .rune-popover-header {
+    padding: 10px 14px;
+    background: var(--bg-dark);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: move;
+    user-select: none;
+  }
+  .rune-popover-title {
+    font-size: 0.875rem;
+    font-weight: 700;
+    color: var(--rune-color);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .rune-popover-close {
+    background: transparent;
+    color: var(--text-muted);
+    padding: 2px 8px;
+    font-size: 1rem;
+    border-radius: 4px;
+  }
+  .rune-popover-close:hover { background: var(--border); color: var(--text-main); }
+  .rune-stash-body {
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: radial-gradient(circle at center, rgba(255,255,255,0.02), rgba(0,0,0,0.45));
+  }
+  .rune-row {
+    display: grid;
+    grid-template-columns: repeat(9, 1fr);
+    gap: 5px;
+  }
+  .rune-row.row-bottom {
+    display: flex;
+    justify-content: center;
+    gap: 5px;
+  }
+  .rune-row.row-bottom .rune-slot {
+    width: calc((100% - 40px) / 9);
+  }
+  .rune-slot {
+    background: var(--bg-dark);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 2px 4px 2px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: space-between;
+    opacity: 0.36;
+    transition: opacity 0.2s, transform 0.15s, border-color 0.2s, box-shadow 0.2s;
+  }
+  .rune-slot.found {
+    opacity: 1;
+    border-color: var(--rune-color);
+    box-shadow: inset 0 0 10px rgba(255, 140, 0, 0.18);
+ }
+  .rune-slot.high-rune.found {
+    border-color: var(--accent);
+    box-shadow: 0 0 10px rgba(255, 140, 0, 0.35), inset 0 0 12px rgba(255, 215, 0, 0.22);
+  }
+  .rune-slot.wss-slot.found {
+    border-color: #c084fc;
+    box-shadow: 0 0 10px rgba(192, 132, 252, 0.4), inset 0 0 12px rgba(168, 85, 247, 0.25);
+  }
+  .rune-slot.wss-slot.found .rune-name {
+    color: #d8b4fe;
+  }
+  .rune-stone {
+    width: 28px;
+    height: 28px;
+    background: linear-gradient(145deg, #52565e, #2b2e33);
+    border: 1px solid #767b85;
+    clip-path: polygon(22% 4%, 78% 4%, 96% 88%, 86% 96%, 14% 96%, 4% 88%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: Georgia, "Times New Roman", serif;
+    font-weight: 700;
+    font-size: 0.72rem;
+    color: #16181c;
+    text-shadow: 0 1px 0 rgba(255,255,255,0.28);
+    margin-bottom: 3px;
+  }
+  .rune-slot.found .rune-stone {
+    background: linear-gradient(145deg, #696e78, #373b42);
+    color: var(--rune-color);
+    text-shadow: 0 0 5px rgba(255, 140, 0, 0.75);
+  }
+  .rune-slot.high-rune.found .rune-stone {
+    color: #ffd700;
+    text-shadow: 0 0 6px rgba(255, 215, 0, 0.9);
+  }
+  .rune-name {
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: var(--text-muted);
+    letter-spacing: 0.02em;
+    line-height: 1.1;
+  }
+  .rune-slot.found .rune-name { color: var(--rune-color); }
+  .rune-count {
+    font-size: 0.75rem;
+    font-weight: 800;
+    color: var(--text-main);
+    margin-top: 2px;
+    line-height: 1.1;
+  }
+  .rune-footer {
+    padding: 7px 14px;
+    background: var(--bg-dark);
+    border-top: 1px solid var(--border);
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    display: flex;
+    justify-content: space-between;
+  }
 </style>
 </head>
 <body>
@@ -545,16 +785,36 @@ const dashboardHTML = `<!DOCTYPE html>
       <option value="hellfire">Theme: Hellfire Crimson</option>
       <option value="tyrael">Theme: Tyrael Gold</option>
       <option value="horadric">Theme: Horadric Arcane</option>
+      <option value="bloodmoor">Theme: Countess Blood Moor</option>
+      <option value="mephisto">Theme: Mephisto's Durance</option>
+      <option value="worldstone">Theme: Baal's Worldstone</option>
+      <option value="chaos">Theme: Chaos Sanctuary</option>
+      <option value="tristram">Theme: Old Tristram</option>
     </select>
     <div id="statusBadge" class="badge stopped">Stopped</div>
     <div class="controls">
       <button id="btnStart" class="btn-start" onclick="api('/api/start')">▶ Start Logger</button>
       <button id="btnStop" class="btn-stop" onclick="api('/api/stop')" disabled>■ Stop</button>
+      <button id="btnRuneMap" class="btn-rune-toggle" onclick="toggleRuneMap()">🌎 Rune Map</button>
       <button class="btn-secondary" onclick="api('/api/open-folder')">📁 Open Folder</button>
       <button class="btn-secondary" onclick="api('/api/quit')">✕ Exit</button>
     </div>
   </div>
 </header>
+
+<!-- Draggable Floating Rune Stash Map -->
+<div id="runePopover" class="rune-popover">
+  <div id="runePopoverHeader" class="rune-popover-header">
+    <div class="rune-popover-title">🛒 PD2 Rune Stash Tracker (Drag to Move)</div>
+    <button class="rune-popover-close" onclick="toggleRuneMap(false)" title="Close Rune Map">✕</button>
+  </div>
+  <div id="runeStashBody" class="rune-stash-body"></div>
+  <div class="rune-footer">
+    <span id="runeUniqueCount">0 / 33 Runes | WSS: 0</span>
+    <span id="runeTotalPop">Total Runes: 0</span>
+  </div>
+</div>
+
 <main>
   <div class="metrics-grid">
     <div class="metric-card">
@@ -565,32 +825,32 @@ const dashboardHTML = `<!DOCTYPE html>
     <div class="metric-card">
       <div class="metric-title">Runes Found</div>
       <div id="mRunes" class="metric-value">0</div>
-      <div class="metric-sub"><span id="mRunesHr">0.0 / hr</span><span id="mRunesPct">0%</span></div>
+      <div class="metric-sub"><span id="mRunesHr">0.0 / hr</span><span id="mRunesPct">0.000000000%</span></div>
     </div>
     <div class="metric-card">
       <div class="metric-title">Mid-High Runes (Pul+)</div>
       <div id="mHighRunes" class="metric-value">0</div>
-      <div class="metric-sub"><span id="mHighRunesHr">0.0 / hr</span><span id="mHighRunesPct">0%</span></div>
+      <div class="metric-sub"><span id="mHighRunesHr">0.0 / hr</span><span id="mHighRunesPct">0.000000000%</span></div>
     </div>
     <div class="metric-card">
       <div class="metric-title">Worldstone Shards</div>
       <div id="mWss" class="metric-value">0</div>
-      <div class="metric-sub"><span id="mWssHr">0.0 / hr</span><span id="mWssPct">0%</span></div>
+      <div class="metric-sub"><span id="mWssHr">0.0 / hr</span><span id="mWssPct">0.000000000%</span></div>
     </div>
     <div class="metric-card">
       <div class="metric-title">Keys Found</div>
       <div id="mKeys" class="metric-value">0</div>
-      <div class="metric-sub"><span id="mKeysHr">0.0 / hr</span><span id="mKeysPct">0%</span></div>
+      <div class="metric-sub"><span id="mKeysHr">0.0 / hr</span><span id="mKeysPct">0.000000000%</span></div>
     </div>
     <div class="metric-card">
       <div class="metric-title">Puzzle Box / Pieces</div>
       <div id="mPuzzle" class="metric-value">0</div>
-      <div class="metric-sub"><span id="mPuzzleHr">0.0 / hr</span><span id="mPuzzlePct">0%</span></div>
+      <div class="metric-sub"><span id="mPuzzleHr">0.0 / hr</span><span id="mPuzzlePct">0.000000000%</span></div>
     </div>
     <div class="metric-card">
       <div class="metric-title">Mirrors / Vials</div>
       <div id="mMirrors" class="metric-value">0</div>
-      <div class="metric-sub"><span id="mMirrorsHr">0.0 / hr</span><span id="mMirrorsPct">0%</span></div>
+      <div class="metric-sub"><span id="mMirrorsHr">0.0 / hr</span><span id="mMirrorsPct">0.000000000%</span></div>
     </div>
   </div>
 
@@ -622,6 +882,141 @@ const dashboardHTML = `<!DOCTYPE html>
 </main>
 <script>
   let lastLogSeq = -1;
+
+  const RUNE_ROWS = [
+    [
+      { name: 'El', num: 1, glyph: 'ᛚ' }, { name: 'Eld', num: 2, glyph: 'ᛉ' }, { name: 'Tir', num: 3, glyph: 'ᛏ' },
+      { name: 'Nef', num: 4, glyph: 'ᚺ' }, { name: 'Eth', num: 5, glyph: 'ᛊ' }, { name: 'Ith', num: 6, glyph: 'ᛇ' },
+      { name: 'Tal', num: 7, glyph: 'ᛟ' }, { name: 'Ral', num: 8, glyph: 'ᚱ' }, { name: 'Ort', num: 9, glyph: 'ᚹ' }
+    ],
+    [
+      { name: 'Thul', num: 10, glyph: 'ᚦ' }, { name: 'Amn', num: 11, glyph: 'ᛃ' }, { name: 'Sol', num: 12, glyph: 'ᛈ' },
+      { name: 'Shael', num: 13, glyph: 'ᛒ' }, { name: 'Dol', num: 14, glyph: 'ᛞ' }, { name: 'Hel', num: 15, glyph: 'ᚻ' },
+      { name: 'Io', num: 16, glyph: 'ᛁ' }, { name: 'Lum', num: 17, glyph: 'ᛚ' }, { name: 'Ko', num: 18, glyph: 'ᚲ' }
+    ],
+    [
+      { name: 'Fal', num: 19, glyph: 'ᚠ' }, { name: 'Lem', num: 20, glyph: 'ᛗ' }, { name: 'Pul', num: 21, glyph: 'ᛈ', hr: true },
+      { name: 'Um', num: 22, glyph: 'ᚢ', hr: true }, { name: 'Mal', num: 23, glyph: 'ᛗ', hr: true }, { name: 'Ist', num: 24, glyph: 'ᛇ', hr: true },
+      { name: 'Gul', num: 25, glyph: 'ᚷ', hr: true }, { name: 'Vex', num: 26, glyph: 'ᚹ', hr: true }, { name: 'Ohm', num: 27, glyph: 'ᛟ', hr: true }
+    ],
+    [
+      { name: 'Lo', num: 28, glyph: 'ᛚ', hr: true }, { name: 'Sur', num: 29, glyph: 'ᛊ', hr: true }, { name: 'Ber', num: 30, glyph: 'ᛒ', hr: true },
+      { name: 'Jah', num: 31, glyph: 'ᛃ', hr: true }, { name: 'Cham', num: 32, glyph: 'ᚲ', hr: true }, { name: 'Zod', num: 33, glyph: 'ᛉ', hr: true },
+      { name: 'WSS', num: 34, isWss: true }
+    ]
+  ];
+
+  const WSS_FALLBACK_SVG = '<svg width="24" height="24" viewBox="0 0 24 24" fill="none">' +
+    '<polygon points="12,1 19,7 17,22 7,22 5,7" fill="#7e22ce" stroke="#e9d5ff" stroke-width="1.4"/>' +
+    '<polygon points="12,1 16,8 12,22 8,8" fill="#c084fc" opacity="0.85"/>' +
+    '</svg>';
+
+  function renderRuneMap(runeCounts, wssTotal) {
+    const body = document.getElementById('runeStashBody');
+    if (!body) return;
+    const counts = runeCounts || {};
+    const wssCount = wssTotal || 0;
+    let uniqueFound = 0;
+    let totalRunes = 0;
+
+    body.innerHTML = RUNE_ROWS.map((row, idx) => {
+      const rowClass = idx === 3 ? 'rune-row row-bottom' : 'rune-row';
+      const slots = row.map(r => {
+        if (r.isWss) {
+          const cls = 'rune-slot wss-slot' + (wssCount > 0 ? ' found' : '');
+          const iconHtml = '<div style="width:28px;height:28px;display:flex;align-items:center;justify-content:center;margin-bottom:3px;">' +
+            '<img src="/assets/wss.png" alt="WSS" style="width:26px;height:26px;object-fit:contain;" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\';">' +
+            '<div style="display:none;align-items:center;justify-content:center;">' + WSS_FALLBACK_SVG + '</div>' +
+          '</div>';
+          return '<div class="' + cls + '" title="Worldstone Shard (' + wssCount + ' found)">' +
+            iconHtml +
+            '<div class="rune-name">WSS</div>' +
+            '<div class="rune-count">' + wssCount + '</div>' +
+          '</div>';
+        }
+        const c = counts[r.name] || 0;
+        if (c > 0) uniqueFound++;
+        totalRunes += c;
+        const cls = 'rune-slot' + (c > 0 ? ' found' : '') + (r.hr ? ' high-rune' : '');
+        return '<div class="' + cls + '" title="#' + r.num + ' ' + r.name + ' Rune (' + c + ' found)">' +
+          '<div class="rune-stone">' + r.glyph + '</div>' +
+          '<div class="rune-name">' + r.name + '</div>' +
+          '<div class="rune-count">' + c + '</div>' +
+        '</div>';
+      }).join('');
+      return '<div class="' + rowClass + '">' + slots + '</div>';
+    }).join('');
+
+    const uEl = document.getElementById('runeUniqueCount');
+    const tEl = document.getElementById('runeTotalPop');
+    if (uEl) uEl.textContent = uniqueFound + ' / 33 Runes | WSS: ' + wssCount;
+    if (tEl) tEl.textContent = 'Total Runes: ' + totalRunes;
+  }
+
+  function toggleRuneMap(forceState) {
+    const pop = document.getElementById('runePopover');
+    const btn = document.getElementById('btnRuneMap');
+    if (!pop || !btn) return;
+    const willOpen = typeof forceState === 'boolean' ? forceState : !pop.classList.contains('open');
+    if (willOpen) {
+      pop.classList.add('open');
+      btn.classList.add('active');
+    } else {
+      pop.classList.remove('open');
+      btn.classList.remove('active');
+    }
+    try { localStorage.setItem('d2_runemap_open', willOpen ? '1' : '0'); } catch (e) {}
+  }
+
+  (function initRuneMapDrag() {
+    const pop = document.getElementById('runePopover');
+    const hdr = document.getElementById('runePopoverHeader');
+    if (!pop || !hdr) return;
+
+    try {
+      const savedPos = JSON.parse(localStorage.getItem('d2_runemap_pos') || 'null');
+      if (savedPos && typeof savedPos.left === 'number' && typeof savedPos.top === 'number') {
+        pop.style.left = Math.max(8, Math.min(window.innerWidth - 120, savedPos.left)) + 'px';
+        pop.style.top = Math.max(8, Math.min(window.innerHeight - 80, savedPos.top)) + 'px';
+        pop.style.right = 'auto';
+      }
+      if (localStorage.getItem('d2_runemap_open') === '1') {
+        toggleRuneMap(true);
+      }
+    } catch (e) {}
+
+    let dragging = false, startX = 0, startY = 0, origLeft = 0, origTop = 0;
+    hdr.addEventListener('mousedown', function(e) {
+      if (e.target.tagName === 'BUTTON') return;
+      dragging = true;
+      const rect = pop.getBoundingClientRect();
+      startX = e.clientX;
+      startY = e.clientY;
+      origLeft = rect.left;
+      origTop = rect.top;
+      pop.style.right = 'auto';
+      pop.style.left = origLeft + 'px';
+      pop.style.top = origTop + 'px';
+      e.preventDefault();
+    });
+    window.addEventListener('mousemove', function(e) {
+      if (!dragging) return;
+      const newLeft = Math.max(0, Math.min(window.innerWidth - pop.offsetWidth, origLeft + (e.clientX - startX)));
+      const newTop = Math.max(0, Math.min(window.innerHeight - pop.offsetHeight, origTop + (e.clientY - startY)));
+      pop.style.left = newLeft + 'px';
+      pop.style.top = newTop + 'px';
+    });
+    window.addEventListener('mouseup', function() {
+      if (!dragging) return;
+      dragging = false;
+      try {
+        localStorage.setItem('d2_runemap_pos', JSON.stringify({
+          left: parseInt(pop.style.left, 10),
+          top: parseInt(pop.style.top, 10)
+        }));
+      } catch (e) {}
+    });
+  })();
 
   async function api(endpoint) {
     try {
@@ -699,6 +1094,8 @@ const dashboardHTML = `<!DOCTYPE html>
         document.getElementById('mMirrorsHr').textContent = m.mirrors_vials.per_hour.toFixed(1) + ' / hr';
         document.getElementById('mMirrorsPct').textContent = m.mirrors_vials.percentage.toFixed(9) + '%';
 
+        renderRuneMap(m.rune_counts, m.wss_found.total);
+
         const locTbody = document.getElementById('locationsTable');
         if (m.top_locations && m.top_locations.length > 0) {
           locTbody.innerHTML = m.top_locations.map(l => 
@@ -741,6 +1138,7 @@ const dashboardHTML = `<!DOCTYPE html>
     setTheme(saved);
   })();
 
+  renderRuneMap({});
   setInterval(refresh, 1000);
   refresh();
 </script>
@@ -755,6 +1153,7 @@ func main() {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(dashboardHTML))
 	})
+	mux.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.Dir(getExeDir()))))
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		state.mu.Lock()
