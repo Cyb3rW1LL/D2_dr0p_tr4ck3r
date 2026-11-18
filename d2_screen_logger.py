@@ -54,7 +54,14 @@ DROP_PATTERNS = [
     r"(?i)larzuk'?s\s+(?:puzzlepiece|puzzlebox)",
     r"(?i)vial\s+of\s+lightsong",
     r"(?i)lilith'?s\s+mirror",
-    r"(?i)key\s+of\s+(terror|hate|destruction)"
+    r"(?i)key\s+of\s+(terror|hate|destruction)",
+    r"(?i)prime\s+evil\s+soul",
+    r"(?i)essence\s+of\s+(terror|hatred|destruction|suffering)",
+    r"(?i)tainted\s+worldstone\s+shard",
+    r"(?i)demonic\s+cube",
+    r"(?i)hellfire\s+torch",
+    r"(?i)catalyst\s+shard",
+    r"(?i)horadrim\s+scarab"
 ]
 
 # 5. Complete Vanilla + Project Diablo 2 (Through Season 14 Alliance) Zone List
@@ -101,7 +108,7 @@ KNOWN_ZONES = [
     # --- PD2 Tier 3 Maps ---
     "Arreat Battlefield", "Bastion Keep", "Blood Moon", "Demon Road",
     "Kehjistan Marketplace", "River of Blood",
-    "Royal Crypts", "Skovos Stronghold", "Kyovoshad"
+    "Royal Crypts", "Skovos Stronghold", "Kyovoshad", "Bitter Depths",
 
     # --- PD2 Tier 4 Dungeons ---
     "Plains of Torment", "Sanctuary of Sin", "Steppes of Daken-Shar",
