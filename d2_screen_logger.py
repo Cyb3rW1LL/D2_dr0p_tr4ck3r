@@ -49,6 +49,7 @@ DROP_PATTERNS = [
     r"(?i)\b(el|eld|tir|nef|eth|ith|tal|ral|ort|thul|amn|sol|shael|dol|hel|lum|ko|fal|lem|pul|um|mal|ist|gul|vex|ohm|sur|ber|jah|cham|zod)\s+rune\b",
     r"\b(?:Io|IO)\s+(?:Rune|RUNE|rune)\b",
     r"\b(?:Lo|LO)\s+(?:Rune|RUNE|rune)\b",
+    r"(?i)tainted\s+worldstone\s+shard",
     r"(?i)worldstone\s+shard",
     r"(?i)larzuk'?s\s+puzzlebox|puzzlebox",
     r"(?i)larzuk'?s\s+(?:puzzlepiece|puzzlebox)",
@@ -57,7 +58,6 @@ DROP_PATTERNS = [
     r"(?i)key\s+of\s+(terror|hate|destruction)",
     r"(?i)prime\s+evil\s+soul",
     r"(?i)essence\s+of\s+(terror|hatred|destruction|suffering)",
-    r"(?i)tainted\s+worldstone\s+shard",
     r"(?i)demonic\s+cube",
     r"(?i)hellfire\s+torch",
     r"(?i)catalyst\s+shard",
@@ -111,7 +111,7 @@ KNOWN_ZONES = [
     "Royal Crypts", "Skovos Stronghold", "Kyovoshad", "Bitter Depths",
 
     # --- PD2 Tier 4 Dungeons ---
-    "Plains of Torment", "Sanctuary of Sin", "Steppes of Daken-Shar",
+    "Plains of Torment", "Sanctuary of Sin", "Steppes of Daken-Shar", "The Tombs of Kanemith",
 
     # --- PD2 Unique Maps & Event Vaults ---
     "City of Ureh", "Djinn's Domain", "Fallen Gardens", "Imperial Palace",
@@ -139,17 +139,18 @@ class DualRegionDropLogger:
         self.recent_drops = {}
         self.last_io_lo_time = 0.0
         self.current_zone = "Unknown Area"
+        self.current_difficulty = "Unknown"
         self.known_zones_lower = {z.lower(): z for z in KNOWN_ZONES}
         self.init_csv()
 
     def init_csv(self):
-        """Creates the CSV log file with Area/Location tracking if it doesn't exist or is empty."""
+        """Creates the CSV log file with Area/Location & Difficulty tracking."""
         csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), LOG_FILE)
         needs_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
         if needs_header:
             with open(csv_path, mode='w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Timestamp", "Location / Area", "Matched Item", "Raw OCR Line"])
+                writer.writerow(["Timestamp", "Location / Area", "Difficulty", "Matched Item", "Raw OCR Line"])
             print(f"[Info] Created new drop log file: {csv_path}")
 
     def preprocess_image(self, img_bgra):
@@ -180,28 +181,38 @@ class DualRegionDropLogger:
         return inverted
 
     def update_current_zone(self, zone_text):
-        """Matches top-right OCR text strictly against known zones (with fuzzy tolerance)."""
-        for line in zone_text.splitlines():
-            clean = re.sub(r'[^A-Za-z\'\-\s]', '', line).strip()
-            if len(clean) < 4:
-                continue
-            
-            clean_lower = clean.lower()
+            """Matches top-right OCR text for Difficulty (Normal/Nightmare/Hell) and Known Zones."""
+            for line in zone_text.splitlines():
+                clean = re.sub(r'[^A-Za-z\'\-\s]', '', line).strip()
+                if len(clean) < 4:
+                    continue
+                
+                clean_lower = clean.lower()
 
-            for known_lower, proper_name in self.known_zones_lower.items():
-                if known_lower in clean_lower:
-                    if self.current_zone != proper_name:
-                        self.current_zone = proper_name
-                        print(f"[Area Changed] -> {self.current_zone}")
-                    return
+                # 1. Check for Difficulty Level (Nightmare first so partial matches don't collide)
+                for diff in ("nightmare", "hell", "normal"):
+                    if re.search(rf"\b{diff}\b", clean_lower):
+                        proper_diff = diff.capitalize()
+                        if self.current_difficulty != proper_diff:
+                            self.current_difficulty = proper_diff
+                            print(f"[Difficulty] -> {self.current_difficulty}")
+                        break
 
-            matches = difflib.get_close_matches(clean_lower, self.known_zones_lower.keys(), n=1, cutoff=0.82)
-            if matches:
-                proper_name = self.known_zones_lower[matches[0]]
-                if self.current_zone != proper_name:
-                    self.current_zone = proper_name
-                    print(f"[Area Changed] -> {self.current_zone}")
-                return
+                # 2. Check for Known Zone
+                for known_lower, proper_name in self.known_zones_lower.items():
+                    if known_lower in clean_lower:
+                        if self.current_zone != proper_name:
+                            self.current_zone = proper_name
+                            print(f"[Area Changed] -> {self.current_zone} ({self.current_difficulty})")
+                        break
+                else:
+                    matches = difflib.get_close_matches(clean_lower, self.known_zones_lower.keys(), n=1, cutoff=0.82)
+                    if matches:
+                        proper_name = self.known_zones_lower[matches[0]]
+                        if self.current_zone != proper_name:
+                            self.current_zone = proper_name
+                            print(f"[Area Changed] -> {self.current_zone} ({self.current_difficulty})")
+                        break
 
     def log_drop(self, item_name, raw_line):
         """Records a valid drop along with the current area to console and CSV, skipping towns."""
@@ -209,10 +220,27 @@ class DualRegionDropLogger:
             return
 
         normalized_item = item_name.strip()
-        if "worldstone shard" in normalized_item.lower():
+        lower_item = normalized_item.lower()
+
+        if "tainted worldstone shard" in lower_item:
+            normalized_item = "Tainted Worldstone Shard"
+        elif "worldstone shard" in lower_item:
             normalized_item = "Worldstone Shard"
-        elif normalized_item.lower().endswith(" rune"):
-            # Normalize casing (e.g., "IO RUNE" -> "Io Rune", "LO RUNE" -> "Lo Rune")
+        elif "prime evil soul" in lower_item:
+            normalized_item = "Prime Evil Soul"
+        elif "demonic cube" in lower_item:
+            normalized_item = "Demonic Cube"
+        elif "hellfire torch" in lower_item:
+            normalized_item = "Hellfire Torch"
+        elif "catalyst shard" in lower_item:
+            normalized_item = "Catalyst Shard"
+        elif "horadrim scarab" in lower_item:
+            normalized_item = "Horadrim Scarab"
+        elif "essence of " in lower_item:
+            # Title-case cleanly: e.g., "Essence of Terror"
+            essence_type = lower_item.split("essence of ")[-1].strip().capitalize()
+            normalized_item = f"Essence of {essence_type}"
+        elif lower_item.endswith(" rune"):
             prefix = normalized_item.split()[0].capitalize()
             normalized_item = f"{prefix} Rune"
 
@@ -231,62 +259,62 @@ class DualRegionDropLogger:
 
         self.recent_drops[clean_key] = now
         timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
+            
         print(f"\n[{timestamp_str}] DROP DETECTED!")
         print(f"  Item : {normalized_item.upper()}")
-        print(f"  Area : {self.current_zone}")
+        print(f"  Area : {self.current_zone} [{self.current_difficulty}]")
         print(f"  Raw  : '{raw_line}'\n")
-        
+            
         self.init_csv()
         csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), LOG_FILE)
         with open(csv_path, mode='a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow([timestamp_str, self.current_zone, normalized_item, raw_line])
+            writer.writerow([timestamp_str, self.current_zone, self.current_difficulty, normalized_item, raw_line])
 
     def run(self):
-        self.init_csv()
-        print("Starting Diablo II Dual-Region Drop Logger (HSV Color Masking Active)...")
-        print(f"Watching Drops (Left) : {DROP_REGION}")
-        print(f"Watching Area (Right) : {ZONE_REGION}")
-        print(f"Scan Rate             : Every {POLL_INTERVAL}s (Town drops ignored)")
-        print(f"Logging to            : {os.path.abspath(LOG_FILE)}")
-        print("Press Ctrl+C to stop.\n")
-
-        with mss.mss() as sct:
-            first_frame = True
-            while True:
-                drop_shot = np.array(sct.grab(DROP_REGION))
-                zone_shot = np.array(sct.grab(ZONE_REGION))
-
-                drop_proc = self.preprocess_image(drop_shot)
-                zone_proc = self.preprocess_image(zone_shot)
-
-                if first_frame and SAVE_DEBUG_IMAGES:
-                    cv2.imwrite("debug_left_drops_raw.png", drop_shot)
-                    cv2.imwrite("debug_left_drops_ocr.png", drop_proc)
-                    cv2.imwrite("debug_right_zone_raw.png", zone_shot)
-                    cv2.imwrite("debug_right_zone_ocr.png", zone_proc)
-                    print("[Info] Saved 4 debug snapshots ('debug_left_drops_*.png' & 'debug_right_zone_*.png').")
-                    print("[Info] Check both '*_ocr.png' images to verify your colored loot filter text is crisp black on white!\n")
-                    first_frame = False
-
-                zone_text = pytesseract.image_to_string(zone_proc, config='--psm 6')
-                self.update_current_zone(zone_text)
-
-                drop_text = pytesseract.image_to_string(drop_proc, config='--psm 6')
-                for line in drop_text.splitlines():
-                    clean_line = line.strip()
-                    if not clean_line:
-                        continue
-
-                    for pattern in DROP_PATTERNS:
-                        match = re.search(pattern, clean_line)
-                        if match:
-                            self.log_drop(match.group(0), clean_line)
-                            break
-
-                time.sleep(POLL_INTERVAL)
-
+                self.init_csv()
+                print("Starting Diablo II Dual-Region Drop Logger (HSV Color Masking Active)...")
+                print(f"Watching Drops (Left) : {DROP_REGION}")
+                print(f"Watching Area (Right) : {ZONE_REGION}")
+                print(f"Scan Rate             : Every {POLL_INTERVAL}s (Town drops ignored)")
+                print(f"Logging to            : {os.path.abspath(LOG_FILE)}")
+                print("Press Ctrl+C to stop.\n")
+    
+                with mss.mss() as sct:
+                    first_frame = True
+                    while True:
+                        drop_shot = np.array(sct.grab(DROP_REGION))
+                        zone_shot = np.array(sct.grab(ZONE_REGION))
+    
+                        drop_proc = self.preprocess_image(drop_shot)
+                        zone_proc = self.preprocess_image(zone_shot)
+    
+                        if first_frame and SAVE_DEBUG_IMAGES:
+                            cv2.imwrite("debug_left_drops_raw.png", drop_shot)
+                            cv2.imwrite("debug_left_drops_ocr.png", drop_proc)
+                            cv2.imwrite("debug_right_zone_raw.png", zone_shot)
+                            cv2.imwrite("debug_right_zone_ocr.png", zone_proc)
+                            print("[Info] Saved 4 debug snapshots ('debug_left_drops_*.png' & 'debug_right_zone_*.png').")
+                            print("[Info] Check both '*_ocr.png' images to verify your colored loot filter text is crisp black on white!\n")
+                            first_frame = False
+    
+                        zone_text = pytesseract.image_to_string(zone_proc, config='--psm 6')
+                        self.update_current_zone(zone_text)
+    
+                        drop_text = pytesseract.image_to_string(drop_proc, config='--psm 6')
+                        for line in drop_text.splitlines():
+                            clean_line = line.strip()
+                            if not clean_line:
+                                continue
+    
+                            for pattern in DROP_PATTERNS:
+                                match = re.search(pattern, clean_line)
+                                if match:
+                                    self.log_drop(match.group(0), clean_line)
+                                    break
+    
+                        time.sleep(POLL_INTERVAL)
+    
 if __name__ == "__main__":
     logger = DualRegionDropLogger()
     try:
