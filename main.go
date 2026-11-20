@@ -23,6 +23,7 @@ import (
 type DropRecord struct {
 	Timestamp   string `json:"timestamp"`
 	Location    string `json:"location"`
+	Difficulty  string `json:"difficulty"`
 	MatchedItem string `json:"matched_item"`
 	RawLine     string `json:"raw_line"`
 }
@@ -34,10 +35,12 @@ type VelocityStats struct {
 	Percentage float64 `json:"percentage"`
 }
 
-// LocationStat holds drop count and velocity for a specific zone
+// LocationStat holds drop count, rune/WSS breakdown, and velocity for a specific zone
 type LocationStat struct {
 	Name    string  `json:"name"`
 	Count   int     `json:"count"`
+	Runes   int     `json:"runes"`
+	WSS     int     `json:"wss"`
 	PerHour float64 `json:"per_hour"`
 }
 
@@ -50,6 +53,8 @@ type MetricsSummary struct {
 	KeysFound     VelocityStats  `json:"keys_found"`
 	PuzzleFound   VelocityStats  `json:"puzzle_found"`
 	MirrorsVials  VelocityStats  `json:"mirrors_vials"`
+	BossUberItems VelocityStats  `json:"boss_uber_items"`
+	MapCraftItems VelocityStats  `json:"map_craft_items"`
 	TopLocations  []LocationStat `json:"top_locations"`
 	CategoryBreak map[string]int `json:"category_break"`
 	RuneCounts    map[string]int `json:"rune_counts"`
@@ -127,6 +132,7 @@ func readDropsCSV() []DropRecord {
 		return []DropRecord{}
 	}
 
+	// --- ONLY THIS BOTTOM SECTION CHANGES ---
 	var records []DropRecord
 	startIndex := 0
 	if len(rows) > 0 && len(rows[0]) > 0 {
@@ -138,10 +144,21 @@ func readDropsCSV() []DropRecord {
 
 	for i := len(rows) - 1; i >= startIndex; i-- {
 		row := rows[i]
-		if len(row) >= 4 {
+		if len(row) >= 5 {
+			// New 5-column rows: Timestamp, Location, Difficulty, Matched Item, Raw OCR Line
 			records = append(records, DropRecord{
 				Timestamp:   strings.TrimSpace(row[0]),
 				Location:    strings.TrimSpace(row[1]),
+				Difficulty:  strings.TrimSpace(row[2]),
+				MatchedItem: strings.TrimSpace(row[3]),
+				RawLine:     strings.TrimSpace(row[4]),
+			})
+		} else if len(row) == 4 {
+			// Older 4-column rows: Timestamp, Location, Matched Item, Raw OCR Line
+			records = append(records, DropRecord{
+				Timestamp:   strings.TrimSpace(row[0]),
+				Location:    strings.TrimSpace(row[1]),
+				Difficulty:  "-",
 				MatchedItem: strings.TrimSpace(row[2]),
 				RawLine:     strings.TrimSpace(row[3]),
 			})
@@ -153,10 +170,13 @@ func readDropsCSV() []DropRecord {
 // Enforce explicit capitalization for Lo vs Io so lowercase "lo" (misread Io) never counts as a High Rune
 var highRuneRegex = regexp.MustCompile(`(?i)\b(pul|um|mal|ist|gul|vex|ohm|sur|ber|jah|cham|zod)\s+rune\b|\b(?:Lo|LO)\s+(?:Rune|RUNE|rune)\b`)
 var runeRegex = regexp.MustCompile(`(?i)\b(el|eld|tir|nef|eth|ith|tal|ral|ort|thul|amn|sol|shael|dol|hel|lum|ko|fal|lem|pul|um|mal|ist|gul|vex|ohm|sur|ber|jah|cham|zod)\s+rune\b|\b(?:Io|IO|Lo|LO)\s+(?:Rune|RUNE|rune)\b`)
+var taintedWssRegex = regexp.MustCompile(`(?i)tainted\s+worldstone\s+shard`)
 var wssRegex = regexp.MustCompile(`(?i)worldstone\s+shard`)
 var keyRegex = regexp.MustCompile(`(?i)key\s+of\s+(terror|hate|destruction)`)
 var puzzleRegex = regexp.MustCompile(`(?i)puzzle\s*box|puzzle\s*piece`)
 var mirrorVialRegex = regexp.MustCompile(`(?i)lilith'?s\s+mirror|vial\s+of\s+lightsong`)
+var bossUberRegex = regexp.MustCompile(`(?i)prime\s+evil\s+soul|essence\s+of\s+(terror|hatred|destruction|suffering)|hellfire\s+torch`)
+var mapCraftRegex = regexp.MustCompile(`(?i)tainted\s+worldstone\s+shard|demonic\s+cube|catalyst\s+shard|horadrim\s+scarab`)
 
 func extractRuneName(text string) string {
 	m := runeRegex.FindStringSubmatch(text)
@@ -193,8 +213,10 @@ func sortMapToPairs(m map[string]int, limit int) []LocationStat {
 
 func calculateMetrics(drops []DropRecord) MetricsSummary {
 	total := len(drops)
-	var runes, highRunes, wss, keys, puzzle, mirrorsVials int
+	var runes, highRunes, wss, keys, puzzle, mirrorsVials, bossUber, mapCraft int
 	locMap := make(map[string]int)
+	locRunes := make(map[string]int)
+	locWSS := make(map[string]int)
 	runeCounts := make(map[string]int)
 
 	firstTime := time.Now()
@@ -229,13 +251,17 @@ func calculateMetrics(drops []DropRecord) MetricsSummary {
 
 		if rName := extractRuneName(targetText); rName != "" {
 			runes++
+			locRunes[loc]++
 			runeCounts[rName]++
 		}
 		if highRuneRegex.MatchString(targetText) {
 			highRunes++
 		}
-		if wssRegex.MatchString(targetText) {
+		if taintedWssRegex.MatchString(targetText) {
+			// Tainted Worldstone Shard is counted under MapCraftItems rather than regular WSS
+		} else if wssRegex.MatchString(targetText) {
 			wss++
+			locWSS[loc]++
 		}
 		if keyRegex.MatchString(targetText) {
 			keys++
@@ -245,6 +271,12 @@ func calculateMetrics(drops []DropRecord) MetricsSummary {
 		}
 		if mirrorVialRegex.MatchString(targetText) {
 			mirrorsVials++
+		}
+		if bossUberRegex.MatchString(targetText) {
+			bossUber++
+		}
+		if mapCraftRegex.MatchString(targetText) {
+			mapCraft++
 		}
 	}
 
@@ -266,19 +298,23 @@ func calculateMetrics(drops []DropRecord) MetricsSummary {
 		topLocs = append(topLocs, LocationStat{
 			Name:    l.Name,
 			Count:   l.Count,
+			Runes:   locRunes[l.Name],
+			WSS:     locWSS[l.Name],
 			PerHour: float64(l.Count) / hours,
 		})
 	}
 
 	return MetricsSummary{
-		TotalDrops:   calcStat(total),
-		RunesFound:   calcStat(runes),
-		HighRunes:    calcStat(highRunes),
-		WSSFound:     calcStat(wss),
-		KeysFound:    calcStat(keys),
-		PuzzleFound:  calcStat(puzzle),
-		MirrorsVials: calcStat(mirrorsVials),
-		TopLocations: topLocs,
+		TotalDrops:    calcStat(total),
+		RunesFound:    calcStat(runes),
+		HighRunes:     calcStat(highRunes),
+		WSSFound:      calcStat(wss),
+		KeysFound:     calcStat(keys),
+		PuzzleFound:   calcStat(puzzle),
+		MirrorsVials:  calcStat(mirrorsVials),
+		BossUberItems: calcStat(bossUber),
+		MapCraftItems: calcStat(mapCraft),
+		TopLocations:  topLocs,
 		CategoryBreak: map[string]int{
 			"Runes":             runes,
 			"High Runes":        highRunes,
@@ -286,6 +322,8 @@ func calculateMetrics(drops []DropRecord) MetricsSummary {
 			"Keys":              keys,
 			"Puzzle Box/Pieces": puzzle,
 			"Mirrors / Vials":   mirrorsVials,
+			"Boss / Uber Mats":  bossUber,
+			"Map Shards/Cubes":  mapCraft,
 		},
 		RuneCounts: runeCounts,
 	}
@@ -847,10 +885,20 @@ const dashboardHTML = `<!DOCTYPE html>
       <div id="mPuzzle" class="metric-value">0</div>
       <div class="metric-sub"><span id="mPuzzleHr">0.0 / hr</span><span id="mPuzzlePct">0.000000000%</span></div>
     </div>
-    <div class="metric-card">
+ <div class="metric-card">
       <div class="metric-title">Mirrors / Vials</div>
       <div id="mMirrors" class="metric-value">0</div>
       <div class="metric-sub"><span id="mMirrorsHr">0.0 / hr</span><span id="mMirrorsPct">0.000000000%</span></div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-title">Boss / Uber Mats</div>
+      <div id="mBossUber" class="metric-value">0</div>
+      <div class="metric-sub"><span id="mBossUberHr">0.0 / hr</span><span id="mBossUberPct">0.000000000%</span></div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-title">Map Shards / Cubes</div>
+      <div id="mMapCraft" class="metric-value">0</div>
+      <div class="metric-sub"><span id="mMapCraftHr">0.0 / hr</span><span id="mMapCraftPct">0.000000000%</span></div>
     </div>
   </div>
 
@@ -859,8 +907,8 @@ const dashboardHTML = `<!DOCTYPE html>
       <div class="panel-header"><span>Top Drop Locations (Top 10)</span></div>
       <div class="table-container">
         <table>
-          <thead><tr><th>Location</th><th>Drops</th><th>Rate</th></tr></thead>
-          <tbody id="locationsTable"><tr><td colspan="3" style="text-align:center; color:var(--text-muted)">No drop locations recorded yet</td></tr></tbody>
+          <thead><tr><th>Location</th><th>Drops</th><th>Runes</th><th>WSS</th><th>Rate</th></tr></thead>
+          <tbody id="locationsTable"><tr><td colspan="5" style="text-align:center; color:var(--text-muted)">No drop locations recorded yet</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -874,7 +922,7 @@ const dashboardHTML = `<!DOCTYPE html>
     <div class="panel-header"><span>Recent Drops History</span></div>
     <div class="table-container">
       <table>
-        <thead><tr><th>Timestamp</th><th>Location</th><th>Matched Item</th><th>Raw OCR Line</th></tr></thead>
+        <thead><tr><th>Timestamp</th><th>Location</th><th>Difficulty</th><th>Matched Item</th><th>Raw OCR Line</th></tr></thead>
         <tbody id="dropsTable"><tr><td colspan="4" style="text-align:center; color:var(--text-muted)">No drops recorded yet. Start your game and begin farming!</td></tr></tbody>
       </table>
     </div>
@@ -1094,17 +1142,32 @@ const dashboardHTML = `<!DOCTYPE html>
         document.getElementById('mMirrorsHr').textContent = m.mirrors_vials.per_hour.toFixed(1) + ' / hr';
         document.getElementById('mMirrorsPct').textContent = m.mirrors_vials.percentage.toFixed(9) + '%';
 
+        if (m.boss_uber_items) {
+          document.getElementById('mBossUber').textContent = m.boss_uber_items.total;
+          document.getElementById('mBossUberHr').textContent = m.boss_uber_items.per_hour.toFixed(1) + ' / hr';
+          document.getElementById('mBossUberPct').textContent = m.boss_uber_items.percentage.toFixed(9) + '%';
+        }
+        if (m.map_craft_items) {
+          document.getElementById('mMapCraft').textContent = m.map_craft_items.total;
+          document.getElementById('mMapCraftHr').textContent = m.map_craft_items.per_hour.toFixed(1) + ' / hr';
+          document.getElementById('mMapCraftPct').textContent = m.map_craft_items.percentage.toFixed(9) + '%';
+        }
+
         renderRuneMap(m.rune_counts, m.wss_found.total);
 
-        const locTbody = document.getElementById('locationsTable');
+		const locTbody = document.getElementById('locationsTable');
         if (m.top_locations && m.top_locations.length > 0) {
-          locTbody.innerHTML = m.top_locations.map(l => 
-            '<tr><td><strong>' + escapeHtml(l.name) + '</strong></td><td>' + l.count + '</td><td>' + l.per_hour.toFixed(1) + ' / hr</td></tr>'
+          locTbody.innerHTML = m.top_locations.map(l =>
+            '<tr><td><strong>' + escapeHtml(l.name) + '</strong></td>' +
+            '<td>' + l.count + '</td>' +
+            '<td style="color:var(--rune-color); font-weight:700;">' + (l.runes || 0) + '</td>' +
+            '<td style="color:#c084fc; font-weight:700;">' + (l.wss || 0) + '</td>' +
+            '<td>' + l.per_hour.toFixed(1) + ' / hr</td></tr>'
           ).join('');
         } else {
-          locTbody.innerHTML = '<tr><td colspan="3" style="text-align:center; color:var(--text-muted)">No drop locations recorded yet</td></tr>';
+          locTbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-muted)">No drop locations recorded yet</td></tr>';
         }
-      }
+	}
 
       const dropTbody = document.getElementById('dropsTable');
       if (data.drops && data.drops.length > 0) {
@@ -1113,10 +1176,10 @@ const dashboardHTML = `<!DOCTYPE html>
           const itemHtml = isRune
             ? '<span class="rune-item">' + escapeHtml(d.matched_item) + '</span>'
             : '<strong>' + escapeHtml(d.matched_item) + '</strong>';
-          return '<tr><td>' + escapeHtml(d.timestamp) + '</td><td>' + escapeHtml(d.location) + '</td><td>' + itemHtml + '</td><td style="color:var(--text-muted)">' + escapeHtml(d.raw_line) + '</td></tr>';
+          return '<tr><td>' + escapeHtml(d.timestamp) + '</td><td>' + escapeHtml(d.location) + '</td><td>' + escapeHtml(d.difficulty || '-') + '</td><td>' + itemHtml + '</td><td style="color:var(--text-muted)">' + escapeHtml(d.raw_line) + '</td></tr>';
         }).join('');
       } else {
-        dropTbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color:var(--text-muted)">No drops recorded yet. Start your game and begin farming!</td></tr>';
+        dropTbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-muted)">No drops recorded yet. Start your game and begin farming!</td></tr>';
       }
     } catch (e) {}
   }
